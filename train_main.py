@@ -1,0 +1,472 @@
+import json
+import os
+import zipfile
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Subset
+from tqdm import tqdm
+import logging
+
+from pr_VIT_dustmeteo import PRAfricaDustRouteMeteoNet
+
+
+# =========================================================
+# 1) CONFIG
+# =========================================================
+AREA_ROUTE  = [35, -90, -10, 30]   # [north, west, south, east]
+AREA_AFRICA = [35, -17, -10, 30]
+
+T_STEP_HOURS  = 6
+STEPS_PER_DAY = 24 // T_STEP_HOURS
+T_IN          = 7 * STEPS_PER_DAY   # 28 steps — 7-day route window
+T_DUST        = 1 * STEPS_PER_DAY   # 4  steps — 1-day dust snapshot
+
+DATA_DIR     = Path(".")
+AERONET_PATH = Path("PR AEROSOLS DATA/OneDrive_2_02-12-2025/AERONET_20040101_20251231_Cape_San_Juan/20040101_20251231_Cape_San_Juan.tot_lev20")
+
+PATTERN_ERA5_PL = "era5_pl_*.nc"
+PATTERN_ERA5_SL = "era5_sl_*.nc"
+PATTERN_CAMS    = "cams_eac4_*.nc"
+
+CHUNK_TIME = 64   # dask chunk size — larger than T_IN so each window fits in one chunk
+
+# --- Model ---
+ROUTE_PATCH_SIZE = (1, 20, 20)   # (temporal, lat, lon) — spatial must divide route H×W
+EMBED_DIM        = 256
+NUM_HEADS_SPACE  = 4
+NUM_HEADS_FUSION = 4
+DROPOUT          = 0.1
+
+# --- Training ---
+BATCH_SIZE    = 4       # each route sample ~468 MB; increase on large-RAM HPC
+NUM_EPOCHS    = 50
+LR            = 1e-4
+WEIGHT_DECAY  = 1e-4
+VAL_FRAC      = 0.15   # last 15% of time used for validation (no leakage)
+CHECKPOINT_DIR = Path("checkpoints")
+
+# --- Paths ---
+NORM_STATS_PATH = DATA_DIR / "norm_stats.json"
+
+
+# =========================================================
+# 2) FILE OPENERS
+# =========================================================
+def open_nc_or_zipped_nc(path, engine="netcdf4", chunks=None):
+    with open(path, "rb") as f:
+        sig = f.read(4)
+    is_zip = sig == b"PK\x03\x04"
+
+    if not is_zip:
+        ds = xr.open_dataset(path, engine=engine, chunks=chunks)
+        if "valid_time" in ds.coords and "time" not in ds.coords:
+            ds = ds.rename({"valid_time": "time"})
+        return ds.sortby("time") if "time" in ds.coords else ds
+
+    extract_dir = str(path) + "_unzipped"
+    os.makedirs(extract_dir, exist_ok=True)
+    with zipfile.ZipFile(path, "r") as zf:
+        zf.extractall(extract_dir)
+        nc_paths = [
+            os.path.join(extract_dir, name)
+            for name in zf.namelist()
+            if name.endswith(".nc")
+        ]
+    dss = []
+    for p in nc_paths:
+        ds = xr.open_dataset(p, engine=engine, chunks=chunks)
+        if "valid_time" in ds.coords and "time" not in ds.coords:
+            ds = ds.rename({"valid_time": "time"})
+        dss.append(ds)
+    ds_merged = xr.merge(dss, compat="override", join="inner")
+    return ds_merged.sortby("time") if "time" in ds_merged.coords else ds_merged
+
+
+# =========================================================
+# 3) MULTI-FILE LOADER
+# =========================================================
+def load_all_files(data_dir, pattern, chunks=None):
+    files = sorted(Path(data_dir).glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"No files matching '{pattern}' in {data_dir}")
+    print(f"[loader] {len(files)} file(s) for '{pattern}':")
+    for f in files:
+        print(f"         {f.name}")
+    datasets = [open_nc_or_zipped_nc(f, chunks=chunks) for f in files]
+    ds = xr.concat(datasets, dim="time").sortby("time")
+    _, unique_idx = np.unique(ds.time.values, return_index=True)
+    ds = ds.isel(time=unique_idx)
+    print(f"[loader] {len(ds.time)} steps  "
+          f"({pd.Timestamp(ds.time.values[0]).date()} → {pd.Timestamp(ds.time.values[-1]).date()})")
+    return ds
+
+
+# =========================================================
+# 4) GEOGRAPHIC HELPERS
+# =========================================================
+def convert_lon_if_needed(ds, west, east):
+    lon_name = "longitude" if "longitude" in ds.coords else "lon"
+    lons = ds[lon_name].values
+    if np.nanmin(lons) >= 0 and west < 0:
+        west, east = west % 360, east % 360
+    return west, east
+
+
+def crop_area(ds, area):
+    north, west, south, east = area
+    lat_name = "longitude" if "longitude" in ds.coords else "lat"
+    lon_name = "longitude" if "longitude" in ds.coords else "lon"
+    lat_name = "latitude"  if "latitude"  in ds.coords else "lat"
+    lon_name = "longitude" if "longitude" in ds.coords else "lon"
+    west, east = convert_lon_if_needed(ds, west, east)
+    ds = ds.sortby(lat_name).sortby(lon_name)
+    return ds.sel({lat_name: slice(south, north), lon_name: slice(west, east)})
+
+
+# =========================================================
+# 5) CHANNEL ARRAY BUILDERS
+# =========================================================
+def build_pl_all_levels(ds_pl):
+    arrays, channel_names = [], []
+    for var in ["u", "v", "z", "r", "t", "q", "w", "pv"]:
+        if var not in ds_pl.data_vars:
+            raise ValueError(f"{var} not in ds_pl")
+        for lev in ds_pl["pressure_level"].values:
+            da = ds_pl[var].sel(pressure_level=lev)
+            if "pressure_level" in da.coords:
+                da = da.reset_coords("pressure_level", drop=True)
+            ch = f"{var}_{int(lev)}"
+            arrays.append(da.expand_dims(channel=[ch]))
+            channel_names.append(ch)
+    ds_out = xr.concat(arrays, dim="channel")
+    return ds_out.transpose("time", "channel", "latitude", "longitude"), channel_names
+
+
+def build_route_dataset(ds_pl, ds_sl):
+    ds_pl_all, pl_channels = build_pl_all_levels(ds_pl)
+    sl_vars = ["tp", "cp", "lsp", "tcwv", "blh", "msl", "v10", "u10"]
+    arrays_sl = []
+    for var in sl_vars:
+        if var not in ds_sl.data_vars:
+            raise ValueError(f"{var} not in ds_sl")
+        arrays_sl.append(ds_sl[var].expand_dims(channel=[var]))
+    ds_sl_out = xr.concat(arrays_sl, dim="channel").transpose("time", "channel", "latitude", "longitude")
+    return xr.concat([ds_pl_all, ds_sl_out], dim="channel").transpose("time", "channel", "latitude", "longitude")
+
+
+def build_dust_dataset(ds_cams):
+    arr1 = ds_cams["aod550"].expand_dims(channel=["total_aod550"])
+    arr2 = ds_cams["duaod550"].expand_dims(channel=["dust_aod550"])
+    return xr.concat([arr1, arr2], dim="channel").transpose("time", "channel", "latitude", "longitude")
+
+
+# =========================================================
+# 6) AERONET TARGET
+# =========================================================
+def load_aeronet_targets(path):
+    df = pd.read_csv(path, skiprows=6)
+    df["datetime"] = pd.to_datetime(
+        df["Date(dd:mm:yyyy)"] + " " + df["Time(hh:mm:ss)"],
+        format="%d:%m:%Y %H:%M:%S"
+    )
+    for c in ["AOD_440nm-AOD", "AOD_870nm-AOD"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df[["AOD_440nm-AOD", "AOD_870nm-AOD"]] = df[["AOD_440nm-AOD", "AOD_870nm-AOD"]].mask(
+        df[["AOD_440nm-AOD", "AOD_870nm-AOD"]].isin([-999.0, -9999.0])
+    )
+    df = df.set_index("datetime")
+    mask = (
+        df["AOD_440nm-AOD"].notna() & df["AOD_870nm-AOD"].notna()
+        & (df["AOD_440nm-AOD"] > 0) & (df["AOD_870nm-AOD"] > 0)
+    )
+    df["AE_440_870"] = np.nan
+    df.loc[mask, "AE_440_870"] = (
+        -np.log(df.loc[mask, "AOD_440nm-AOD"] / df.loc[mask, "AOD_870nm-AOD"])
+        / np.log(440 / 870)
+    )
+    daily = df["AE_440_870"].resample("D").mean().dropna()
+    print(f"[targets] {len(daily)} valid days  "
+          f"({daily.index[0].date()} → {daily.index[-1].date()})")
+    return daily
+
+
+# =========================================================
+# 7) NORMALIZATION STATS  (compute once, cache to JSON)
+# =========================================================
+def compute_norm_stats(route_da, dust_da, n_samples=200, seed=42):
+    """
+    Estimates per-channel mean and std from n_samples random single timesteps.
+    Peak RAM = one timestep at a time — never loads the full series.
+    """
+    rng = np.random.default_rng(seed)
+    T = route_da.shape[0]
+    idxs = rng.integers(0, T, size=min(n_samples, T))
+
+    r_means, r_stds, d_means, d_stds = [], [], [], []
+    for i in tqdm(idxs, desc="norm stats", unit="step"):
+        xr_ = route_da.isel(time=int(i)).values.astype(np.float32)  # [C_r, H, W]
+        xd_ = dust_da.isel(time=int(i)).values.astype(np.float32)   # [C_d, H, W]
+        r_means.append(xr_.mean(axis=(1, 2)))
+        r_stds.append(xr_.std(axis=(1, 2)))
+        d_means.append(xd_.mean(axis=(1, 2)))
+        d_stds.append(xd_.std(axis=(1, 2)))
+
+    def to_t(lst):
+        return torch.from_numpy(np.stack(lst).mean(axis=0).astype(np.float32)).view(1, -1, 1, 1)
+
+    return to_t(r_means), to_t(r_stds), to_t(d_means), to_t(d_stds)
+
+
+def save_norm_stats(path, route_mean, route_std, dust_mean, dust_std):
+    stats = {
+        "route_mean": route_mean.squeeze().tolist(),
+        "route_std":  route_std.squeeze().tolist(),
+        "dust_mean":  dust_mean.squeeze().tolist(),
+        "dust_std":   dust_std.squeeze().tolist(),
+    }
+    with open(path, "w") as f:
+        json.dump(stats, f)
+    print(f"[norm] stats saved → {path}")
+
+
+def load_norm_stats(path):
+    with open(path) as f:
+        stats = json.load(f)
+    def to_t(key):
+        return torch.tensor(stats[key], dtype=torch.float32).view(1, -1, 1, 1)
+    return to_t("route_mean"), to_t("route_std"), to_t("dust_mean"), to_t("dust_std")
+
+
+# =========================================================
+# 8) LAZY PYTORCH DATASET
+# =========================================================
+class PRLazyDataset(Dataset):
+    """
+    Stores dask-backed xarray DataArrays — never loads the full time series.
+    Each __getitem__ materialises exactly one window via dask.compute().
+    Peak RAM per sample ≈ T_in × C_r × H × W × 4 bytes (~468 MB for 3-month data).
+    """
+
+    def __init__(
+        self,
+        route_da, dust_da,
+        targets, times,
+        T_in, T_dust,
+        route_mean=None, route_std=None,
+        dust_mean=None,  dust_std=None,
+    ):
+        self.route_da   = route_da
+        self.dust_da    = dust_da
+        self.T_in       = T_in
+        self.T_dust     = T_dust
+        self.route_mean = route_mean  # [1, C_r, 1, 1]
+        self.route_std  = route_std
+        self.dust_mean  = dust_mean
+        self.dust_std   = dust_std
+
+        targets_index = pd.DatetimeIndex(targets.index).normalize()
+        self.samples = []
+        for i in range(len(times) - T_in):
+            t_target = pd.Timestamp(times[i + T_in - 1]).normalize()
+            if t_target in targets_index:
+                self.samples.append((i, float(targets.loc[t_target])))
+
+        print(f"[dataset] {len(self.samples)} valid samples")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        i, y = self.samples[idx]
+        x_route = torch.from_numpy(
+            self.route_da.isel(time=slice(i, i + self.T_in)).values
+        )   # [T_in, C_r, H_r, W_r]
+        x_dust = torch.from_numpy(
+            self.dust_da.isel(time=slice(i, i + self.T_dust)).values
+        )   # [T_dust, 2, H_d, W_d]
+
+        if self.route_mean is not None:
+            x_route = (x_route - self.route_mean) / (self.route_std + 1e-6)
+        if self.dust_mean is not None:
+            x_dust = (x_dust - self.dust_mean) / (self.dust_std + 1e-6)
+
+        return x_route, x_dust, torch.tensor(y, dtype=torch.float32)
+
+
+# =========================================================
+# 9) TRAINING
+# =========================================================
+def run_epoch(model, loader, device, optimizer=None):
+    """Single train or eval pass. Pass optimizer=None for validation."""
+    is_train = optimizer is not None
+    model.train() if is_train else model.eval()
+
+    total_loss, n = 0.0, 0
+    ctx = torch.enable_grad() if is_train else torch.no_grad()
+
+    with ctx:
+        for batch_idx, (x_route, x_dust, y) in enumerate(tqdm(loader, desc="train" if is_train else "val", leave=False)):
+            x_route = x_route.to(device, non_blocking=True)  # [B, T_in, C_r, H, W]
+            x_dust  = x_dust.to(device, non_blocking=True)   # [B, T_dust, 2, H_d, W_d]
+            y       = y.to(device, non_blocking=True)         # [B]
+
+            y_hat = model(x_dust, x_route, return_attn=False)  # [B, 1]
+            loss  = F.mse_loss(y_hat.squeeze(-1), y)
+
+            if is_train:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                print(f"  batch {batch_idx + 1}/{len(loader)}  MSE={loss.item():.4f}")
+
+            total_loss += loss.item() * len(y)
+            n += len(y)
+
+    return total_loss / n
+
+
+# =========================================================
+# 10) MAIN
+# =========================================================
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[device] {device}")
+
+    # ----------------------------------------------------------
+    # Load files (dask — lazy, no data read yet)
+    # ----------------------------------------------------------
+    chunks = {"time": CHUNK_TIME}
+    print("\n--- LOADING ERA5 PL ---")
+    ds_pl = load_all_files(DATA_DIR, PATTERN_ERA5_PL, chunks=chunks)
+    print("\n--- LOADING ERA5 SL ---")
+    ds_sl = load_all_files(DATA_DIR, PATTERN_ERA5_SL, chunks=chunks)
+    print("\n--- LOADING CAMS ---")
+    ds_cams = load_all_files(DATA_DIR, PATTERN_CAMS, chunks=chunks)
+
+    # ----------------------------------------------------------
+    # Crop + build channel DataArrays (still lazy)
+    # ----------------------------------------------------------
+    ds_pl_route    = crop_area(ds_pl,   AREA_ROUTE)
+    ds_sl_route    = crop_area(ds_sl,   AREA_ROUTE)
+    ds_cams_africa = crop_area(ds_cams, AREA_AFRICA)
+
+    route_da = build_route_dataset(ds_pl_route, ds_sl_route)
+    dust_da  = build_dust_dataset(ds_cams_africa)
+
+    # ----------------------------------------------------------
+    # Trim spatial dims to be divisible by patch size.
+    # PatchEmbed3D requires H % patch_y == 0, W % patch_x == 0.
+    # ERA5 over [35N,90W,10S,30E] gives 181×481; trim to 180×480.
+    # ----------------------------------------------------------
+    _, py, px = ROUTE_PATCH_SIZE
+    H_trim = (route_da.shape[2] // py) * py
+    W_trim = (route_da.shape[3] // px) * px
+    if H_trim != route_da.shape[2] or W_trim != route_da.shape[3]:
+        route_da = route_da.isel(latitude=slice(0, H_trim), longitude=slice(0, W_trim))
+        print(f"[spatial] route trimmed to {H_trim}×{W_trim}")
+
+    # ----------------------------------------------------------
+    # Align both to 6-hourly grid using only real timestamps
+    # ----------------------------------------------------------
+    all_times    = pd.DatetimeIndex(route_da.time.values)
+    target_times = all_times[all_times.hour % T_STEP_HOURS == 0]
+    route_da = route_da.sel(time=target_times)
+    dust_da  = dust_da.sel(time=target_times)
+    times    = route_da.time.values
+
+    route_channel_names = list(route_da.coords["channel"].values)
+    print(f"\nRoute: {route_da.shape}   channels: {len(route_channel_names)}")
+    print(f"Dust : {dust_da.shape}")
+
+    # ----------------------------------------------------------
+    # AERONET targets
+    # ----------------------------------------------------------
+    targets = load_aeronet_targets(AERONET_PATH)
+
+    # ----------------------------------------------------------
+    # Norm stats — compute once, cache to JSON
+    # ----------------------------------------------------------
+    if NORM_STATS_PATH.exists():
+        route_mean, route_std, dust_mean, dust_std = load_norm_stats(NORM_STATS_PATH)
+        print(f"[norm] loaded from {NORM_STATS_PATH}")
+    else:
+        route_mean, route_std, dust_mean, dust_std = compute_norm_stats(route_da, dust_da)
+        save_norm_stats(NORM_STATS_PATH, route_mean, route_std, dust_mean, dust_std)
+
+    # ----------------------------------------------------------
+    # Dataset — time-based train / val split (no data leakage)
+    # ----------------------------------------------------------
+    full_dataset = PRLazyDataset(
+        route_da, dust_da, targets, times, T_IN, T_DUST,
+        route_mean, route_std, dust_mean, dust_std,
+    )
+
+    n_val   = max(1, int(len(full_dataset) * VAL_FRAC))
+    n_train = len(full_dataset) - n_val
+    train_ds = Subset(full_dataset, range(n_train))
+    val_ds   = Subset(full_dataset, range(n_train, len(full_dataset)))
+    print(f"[split] train={len(train_ds)}  val={len(val_ds)}")
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=0, pin_memory=device.type == "cuda")
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=0, pin_memory=device.type == "cuda")
+
+    # ----------------------------------------------------------
+    # Model
+    # ----------------------------------------------------------
+    model = PRAfricaDustRouteMeteoNet(
+        route_channel_names=route_channel_names,
+        route_patch_size=ROUTE_PATCH_SIZE,
+        embed_dim=EMBED_DIM,
+        num_heads_space=NUM_HEADS_SPACE,
+        num_heads_fusion=NUM_HEADS_FUSION,
+        dropout=DROPOUT,
+        out_dim=1,
+    ).to(device)
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[model] {n_params:,} trainable parameters")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+
+    # ----------------------------------------------------------
+    # Training loop
+    # ----------------------------------------------------------
+    CHECKPOINT_DIR.mkdir(exist_ok=True)
+    best_val_loss = float("inf")
+
+    for epoch in range(1, NUM_EPOCHS + 1):
+        train_loss = run_epoch(model, train_loader, device, optimizer=optimizer)
+        val_loss   = run_epoch(model, val_loader,   device, optimizer=None)
+        scheduler.step()
+
+        lr_now = scheduler.get_last_lr()[0]
+        print(f"Epoch {epoch:3d}/{NUM_EPOCHS}  "
+              f"train_MSE={train_loss:.4f}  val_MSE={val_loss:.4f}  lr={lr_now:.2e}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            ckpt = CHECKPOINT_DIR / "best.pt"
+            torch.save({
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "val_loss": val_loss,
+                "route_channel_names": route_channel_names,
+            }, ckpt)
+            print(f"           ✓ saved best checkpoint (val_MSE={val_loss:.4f})")
+
+    print(f"\nTraining complete. Best val MSE: {best_val_loss:.4f}")
+    print(f"Best checkpoint: {CHECKPOINT_DIR / 'best.pt'}")
+
+
+if __name__ == "__main__":
+    main()
