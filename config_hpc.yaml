@@ -1,0 +1,38 @@
+# ── Paths ────────────────────────────────────────────────────────────────────
+data_dir: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA"
+aeronet_path: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/20040101_20251231_Cape_San_Juan.tot_lev20"
+norm_stats_path: "norm_stats.json"
+checkpoint_dir: "checkpoints"
+
+# File glob patterns for monthly NetCDF files
+pattern_era5_pl: "era5_pl_*.nc"
+pattern_era5_sl: "era5_sl_*.nc"
+pattern_cams:    "cams_eac4_*.nc"
+
+# ── Spatial domains  [north, west, south, east] ───────────────────────────────
+area_route:  [35, -90, -10,  30]   # Africa → Atlantic → Caribbean (ERA5)
+area_africa: [35, -17, -10,  30]   # Africa dust source region (CAMS)
+
+# ── Temporal ─────────────────────────────────────────────────────────────────
+t_step_hours: 6      # target temporal resolution (hours)
+t_in_days:    7      # route input window length (days)
+t_dust_days:  1      # dust source snapshot length (days)
+
+# ── Data loading ──────────────────────────────────────────────────────────────
+chunk_time:       64    # dask chunk size along time axis
+norm_n_samples:   200   # timesteps sampled to estimate norm stats
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+route_patch_size: [1, 20, 20]   # (temporal, lat, lon) patch size for PatchEmbed3D
+embed_dim:        256
+num_heads_space:  4
+num_heads_fusion: 4
+dropout:          0.1
+out_dim:          1             # regression: scalar AE 440-870
+
+# ── Training ──────────────────────────────────────────────────────────────────
+batch_size:   4
+num_epochs:   50
+lr:           1.0e-4
+weight_decay: 1.0e-4
+val_frac:     0.15   # fraction of samples (by time) held out for validation

@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import zipfile
@@ -6,53 +7,34 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import xarray as xr
+import yaml
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
-import logging
 
 from pr_VIT_dustmeteo import PRAfricaDustRouteMeteoNet
 
 
 # =========================================================
-# 1) CONFIG
+# 1) CONFIG LOADER
 # =========================================================
-AREA_ROUTE  = [35, -90, -10, 30]   # [north, west, south, east]
-AREA_AFRICA = [35, -17, -10, 30]
+def load_config(path="config.yaml"):
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
 
-T_STEP_HOURS  = 6
-STEPS_PER_DAY = 24 // T_STEP_HOURS
-T_IN          = 7 * STEPS_PER_DAY   # 28 steps — 7-day route window
-T_DUST        = 1 * STEPS_PER_DAY   # 4  steps — 1-day dust snapshot
+    # Derived time steps
+    steps_per_day       = 24 // cfg["t_step_hours"]
+    cfg["t_in"]         = cfg["t_in_days"]   * steps_per_day
+    cfg["t_dust"]       = cfg["t_dust_days"] * steps_per_day
+    cfg["steps_per_day"] = steps_per_day
 
-DATA_DIR     = Path(".")
-AERONET_PATH = Path("PR AEROSOLS DATA/OneDrive_2_02-12-2025/AERONET_20040101_20251231_Cape_San_Juan/20040101_20251231_Cape_San_Juan.tot_lev20")
+    # Coerce types
+    cfg["route_patch_size"] = tuple(cfg["route_patch_size"])
+    cfg["area_route"]       = list(cfg["area_route"])
+    cfg["area_africa"]      = list(cfg["area_africa"])
 
-PATTERN_ERA5_PL = "era5_pl_*.nc"
-PATTERN_ERA5_SL = "era5_sl_*.nc"
-PATTERN_CAMS    = "cams_eac4_*.nc"
-
-CHUNK_TIME = 64   # dask chunk size — larger than T_IN so each window fits in one chunk
-
-# --- Model ---
-ROUTE_PATCH_SIZE = (1, 20, 20)   # (temporal, lat, lon) — spatial must divide route H×W
-EMBED_DIM        = 256
-NUM_HEADS_SPACE  = 4
-NUM_HEADS_FUSION = 4
-DROPOUT          = 0.1
-
-# --- Training ---
-BATCH_SIZE    = 4       # each route sample ~468 MB; increase on large-RAM HPC
-NUM_EPOCHS    = 50
-LR            = 1e-4
-WEIGHT_DECAY  = 1e-4
-VAL_FRAC      = 0.15   # last 15% of time used for validation (no leakage)
-CHECKPOINT_DIR = Path("checkpoints")
-
-# --- Paths ---
-NORM_STATS_PATH = DATA_DIR / "norm_stats.json"
+    return cfg
 
 
 # =========================================================
@@ -335,6 +317,26 @@ def run_epoch(model, loader, device, optimizer=None):
 # 10) MAIN
 # =========================================================
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="config.yaml", help="Path to YAML config file")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    print(f"[config] loaded from {args.config}")
+
+    # Unpack config
+    DATA_DIR        = Path(cfg["data_dir"])
+    AERONET_PATH    = Path(cfg["aeronet_path"])
+    NORM_STATS_PATH = Path(cfg["norm_stats_path"])
+    CHECKPOINT_DIR  = Path(cfg["checkpoint_dir"])
+    AREA_ROUTE      = cfg["area_route"]
+    AREA_AFRICA     = cfg["area_africa"]
+    T_STEP_HOURS    = cfg["t_step_hours"]
+    T_IN            = cfg["t_in"]
+    T_DUST          = cfg["t_dust"]
+    CHUNK_TIME      = cfg["chunk_time"]
+    ROUTE_PATCH_SIZE = cfg["route_patch_size"]
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[device] {device}")
 
@@ -343,11 +345,11 @@ def main():
     # ----------------------------------------------------------
     chunks = {"time": CHUNK_TIME}
     print("\n--- LOADING ERA5 PL ---")
-    ds_pl = load_all_files(DATA_DIR, PATTERN_ERA5_PL, chunks=chunks)
+    ds_pl = load_all_files(DATA_DIR, cfg["pattern_era5_pl"], chunks=chunks)
     print("\n--- LOADING ERA5 SL ---")
-    ds_sl = load_all_files(DATA_DIR, PATTERN_ERA5_SL, chunks=chunks)
+    ds_sl = load_all_files(DATA_DIR, cfg["pattern_era5_sl"], chunks=chunks)
     print("\n--- LOADING CAMS ---")
-    ds_cams = load_all_files(DATA_DIR, PATTERN_CAMS, chunks=chunks)
+    ds_cams = load_all_files(DATA_DIR, cfg["pattern_cams"], chunks=chunks)
 
     # ----------------------------------------------------------
     # Crop + build channel DataArrays (still lazy)
@@ -396,7 +398,9 @@ def main():
         route_mean, route_std, dust_mean, dust_std = load_norm_stats(NORM_STATS_PATH)
         print(f"[norm] loaded from {NORM_STATS_PATH}")
     else:
-        route_mean, route_std, dust_mean, dust_std = compute_norm_stats(route_da, dust_da)
+        route_mean, route_std, dust_mean, dust_std = compute_norm_stats(
+            route_da, dust_da, n_samples=cfg["norm_n_samples"]
+        )
         save_norm_stats(NORM_STATS_PATH, route_mean, route_std, dust_mean, dust_std)
 
     # ----------------------------------------------------------
@@ -407,15 +411,15 @@ def main():
         route_mean, route_std, dust_mean, dust_std,
     )
 
-    n_val   = max(1, int(len(full_dataset) * VAL_FRAC))
+    n_val   = max(1, int(len(full_dataset) * cfg["val_frac"]))
     n_train = len(full_dataset) - n_val
     train_ds = Subset(full_dataset, range(n_train))
     val_ds   = Subset(full_dataset, range(n_train, len(full_dataset)))
     print(f"[split] train={len(train_ds)}  val={len(val_ds)}")
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+    train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True,
                               num_workers=0, pin_memory=device.type == "cuda")
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
+    val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"], shuffle=False,
                               num_workers=0, pin_memory=device.type == "cuda")
 
     # ----------------------------------------------------------
@@ -424,32 +428,37 @@ def main():
     model = PRAfricaDustRouteMeteoNet(
         route_channel_names=route_channel_names,
         route_patch_size=ROUTE_PATCH_SIZE,
-        embed_dim=EMBED_DIM,
-        num_heads_space=NUM_HEADS_SPACE,
-        num_heads_fusion=NUM_HEADS_FUSION,
-        dropout=DROPOUT,
-        out_dim=1,
+        embed_dim=cfg["embed_dim"],
+        num_heads_space=cfg["num_heads_space"],
+        num_heads_fusion=cfg["num_heads_fusion"],
+        dropout=cfg["dropout"],
+        out_dim=cfg["out_dim"],
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] {n_params:,} trainable parameters")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"]
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg["num_epochs"]
+    )
 
     # ----------------------------------------------------------
     # Training loop
     # ----------------------------------------------------------
     CHECKPOINT_DIR.mkdir(exist_ok=True)
     best_val_loss = float("inf")
+    num_epochs    = cfg["num_epochs"]
 
-    for epoch in range(1, NUM_EPOCHS + 1):
+    for epoch in range(1, num_epochs + 1):
         train_loss = run_epoch(model, train_loader, device, optimizer=optimizer)
         val_loss   = run_epoch(model, val_loader,   device, optimizer=None)
         scheduler.step()
 
         lr_now = scheduler.get_last_lr()[0]
-        print(f"Epoch {epoch:3d}/{NUM_EPOCHS}  "
+        print(f"Epoch {epoch:3d}/{num_epochs}  "
               f"train_MSE={train_loss:.4f}  val_MSE={val_loss:.4f}  lr={lr_now:.2e}")
 
         if val_loss < best_val_loss:
@@ -461,6 +470,7 @@ def main():
                 "optimizer_state": optimizer.state_dict(),
                 "val_loss": val_loss,
                 "route_channel_names": route_channel_names,
+                "config": cfg,
             }, ckpt)
             print(f"           ✓ saved best checkpoint (val_MSE={val_loss:.4f})")
 

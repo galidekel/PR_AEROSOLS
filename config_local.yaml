@@ -1,0 +1,38 @@
+# ── Paths ────────────────────────────────────────────────────────────────────
+data_dir: "."
+aeronet_path: "PR AEROSOLS DATA/OneDrive_2_02-12-2025/AERONET_20040101_20251231_Cape_San_Juan/20040101_20251231_Cape_San_Juan.tot_lev20"
+norm_stats_path: "norm_stats.json"
+checkpoint_dir: "checkpoints"
+
+# File glob patterns for monthly NetCDF files
+pattern_era5_pl: "era5_pl_*.nc"
+pattern_era5_sl: "era5_sl_*.nc"
+pattern_cams:    "cams_eac4_*.nc"
+
+# ── Spatial domains  [north, west, south, east] ───────────────────────────────
+area_route:  [35, -90, -10,  30]
+area_africa: [35, -17, -10,  30]
+
+# ── Temporal ─────────────────────────────────────────────────────────────────
+t_step_hours: 6
+t_in_days:    7
+t_dust_days:  1
+
+# ── Data loading ──────────────────────────────────────────────────────────────
+chunk_time:       64
+norm_n_samples:   200
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+route_patch_size: [1, 20, 20]
+embed_dim:        256
+num_heads_space:  4
+num_heads_fusion: 4
+dropout:          0.1
+out_dim:          1
+
+# ── Training ──────────────────────────────────────────────────────────────────
+batch_size:   4
+num_epochs:   50
+lr:           1.0e-4
+weight_decay: 1.0e-4
+val_frac:     0.15

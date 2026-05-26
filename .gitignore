@@ -1,0 +1,30 @@
+# Large data files — stored on HPC, not tracked in git
+*.nc
+*_unzipped/
+era5_sl_mslp_tp_cp_lsp_blh_u10_v10_tcwv_3h_202412/
+
+# Raw AERONET data (463 MB)
+PR AEROSOLS DATA/
+
+# Model checkpoints (regeneratable)
+checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Active config — machine-specific, not tracked (use config_local.yaml or config_hpc.yaml)
+config.yaml
+
+# IDE
+.idea/
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
