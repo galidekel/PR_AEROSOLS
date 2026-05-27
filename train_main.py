@@ -24,15 +24,20 @@ def load_config(path="config.yaml"):
         cfg = yaml.safe_load(f)
 
     # Derived time steps
-    steps_per_day       = 24 // cfg["t_step_hours"]
-    cfg["t_in"]         = cfg["t_in_days"]   * steps_per_day
-    cfg["t_dust"]       = cfg["t_dust_days"] * steps_per_day
+    steps_per_day        = 24 // cfg["t_step_hours"]
+    cfg["t_in"]          = cfg["t_in_days"]  * steps_per_day
+    cfg["t_dust"]        = cfg["t_dust_days"] * steps_per_day
     cfg["steps_per_day"] = steps_per_day
 
     # Coerce types
     cfg["route_patch_size"] = tuple(cfg["route_patch_size"])
     cfg["area_route"]       = list(cfg["area_route"])
     cfg["area_africa"]      = list(cfg["area_africa"])
+
+    # Support both old single data_dir and new split era5_dir/cams_dir
+    if "data_dir" in cfg and "era5_dir" not in cfg:
+        cfg["era5_dir"] = cfg["data_dir"]
+        cfg["cams_dir"] = cfg["data_dir"]
 
     return cfg
 
@@ -325,7 +330,8 @@ def main():
     print(f"[config] loaded from {args.config}")
 
     # Unpack config
-    DATA_DIR        = Path(cfg["data_dir"])
+    ERA5_DIR        = Path(cfg["era5_dir"])
+    CAMS_DIR        = Path(cfg["cams_dir"])
     AERONET_PATH    = Path(cfg["aeronet_path"])
     NORM_STATS_PATH = Path(cfg["norm_stats_path"])
     CHECKPOINT_DIR  = Path(cfg["checkpoint_dir"])
@@ -345,11 +351,11 @@ def main():
     # ----------------------------------------------------------
     chunks = {"time": CHUNK_TIME}
     print("\n--- LOADING ERA5 PL ---")
-    ds_pl = load_all_files(DATA_DIR, cfg["pattern_era5_pl"], chunks=chunks)
+    ds_pl = load_all_files(ERA5_DIR, cfg["pattern_era5_pl"], chunks=chunks)
     print("\n--- LOADING ERA5 SL ---")
-    ds_sl = load_all_files(DATA_DIR, cfg["pattern_era5_sl"], chunks=chunks)
+    ds_sl = load_all_files(ERA5_DIR, cfg["pattern_era5_sl"], chunks=chunks)
     print("\n--- LOADING CAMS ---")
-    ds_cams = load_all_files(DATA_DIR, cfg["pattern_cams"], chunks=chunks)
+    ds_cams = load_all_files(CAMS_DIR, cfg["pattern_cams"], chunks=chunks)
 
     # ----------------------------------------------------------
     # Crop + build channel DataArrays (still lazy)

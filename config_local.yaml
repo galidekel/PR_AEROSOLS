@@ -1,5 +1,6 @@
 # ── Paths ────────────────────────────────────────────────────────────────────
-data_dir: "."
+era5_dir:  "."
+cams_dir:  "."
 aeronet_path: "PR AEROSOLS DATA/OneDrive_2_02-12-2025/AERONET_20040101_20251231_Cape_San_Juan/20040101_20251231_Cape_San_Juan.tot_lev20"
 norm_stats_path: "norm_stats.json"
 checkpoint_dir: "checkpoints"
