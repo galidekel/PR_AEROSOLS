@@ -8,7 +8,7 @@ import argparse
 # -----------------------
 # USER SETTINGS
 # -----------------------
-OUTDIR = Path("/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS/era5_dataset")
+OUTDIR = Path("/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/era5_dataset")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 # [North, West, South, East]  (example: Africa→Atlantic→Caribbean)
