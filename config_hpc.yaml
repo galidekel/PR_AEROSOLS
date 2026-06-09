@@ -3,6 +3,7 @@ era5_dir:  "/scratch/galidek_pr/era5_dataset"
 cams_dir:  "/scratch/galidek_pr/cams_dataset"
 aeronet_path: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/20040101_20251231_Cape_San_Juan.tot_lev20"
 norm_stats_path: "norm_stats.json"
+memmap_dir: "/scratch/galidek_pr"
 checkpoint_dir: "checkpoints"
 
 # File glob patterns for monthly NetCDF files

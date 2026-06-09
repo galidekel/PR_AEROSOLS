@@ -8,11 +8,15 @@ SCRATCH=/scratch/galidek_pr
 
 cd $CODE_DIR
 
-echo "[scratch] copying ERA5..."
-mkdir -p $SCRATCH
-cp -r $DATA_SRC/era5_dataset $SCRATCH/
-echo "[scratch] copying CAMS..."
-cp -r $DATA_SRC/cams_dataset $SCRATCH/
-echo "[scratch] done, starting training..."
+if [ ! -f $SCRATCH/route.dat ]; then
+    echo "[scratch] memmap not found, running preprocessing..."
+    cp -r $DATA_SRC/era5_dataset $SCRATCH/
+    cp -r $DATA_SRC/cams_dataset $SCRATCH/
+    $PYTHON -u preprocess_memmap.py --config config_hpc.yaml --scratch $SCRATCH
+    echo "[scratch] preprocessing done."
+else
+    echo "[scratch] memmap found, skipping preprocessing."
+fi
 
-$PYTHON train_main.py --config config_hpc.yaml
+echo "[scratch] starting training..."
+$PYTHON -u train_main.py --config config_hpc.yaml

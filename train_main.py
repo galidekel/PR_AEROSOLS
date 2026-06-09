@@ -235,9 +235,8 @@ def load_norm_stats(path):
 # =========================================================
 class PRLazyDataset(Dataset):
     """
-    Stores dask-backed xarray DataArrays — never loads the full time series.
-    Each __getitem__ materialises exactly one window via dask.compute().
-    Peak RAM per sample ≈ T_in × C_r × H × W × 4 bytes (~468 MB for 3-month data).
+    If memmap files exist on scratch, uses np.memmap for O(1) index access.
+    Falls back to dask-backed xarray DataArrays otherwise (slow on NFS).
     """
 
     def __init__(
@@ -247,15 +246,39 @@ class PRLazyDataset(Dataset):
         T_in, T_dust,
         route_mean=None, route_std=None,
         dust_mean=None,  dust_std=None,
+        memmap_dir=None,
     ):
-        self.route_da   = route_da
-        self.dust_da    = dust_da
         self.T_in       = T_in
         self.T_dust     = T_dust
-        self.route_mean = route_mean  # [1, C_r, 1, 1]
+        self.route_mean = route_mean
         self.route_std  = route_std
         self.dust_mean  = dust_mean
         self.dust_std   = dust_std
+
+        # Use memmap if available, else fall back to xarray/dask
+        if memmap_dir is not None:
+            route_path = Path(memmap_dir) / "route.dat"
+            dust_path  = Path(memmap_dir) / "dust.dat"
+            meta_path  = Path(memmap_dir) / "meta.json"
+            if route_path.exists() and dust_path.exists() and meta_path.exists():
+                import json
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                rs = tuple(meta["route_shape"])
+                ds_ = tuple(meta["dust_shape"])
+                self.route_src = np.memmap(route_path, dtype="float32", mode="r", shape=rs)
+                self.dust_src  = np.memmap(dust_path,  dtype="float32", mode="r", shape=ds_)
+                self.use_memmap = True
+                print(f"[dataset] using memmap from {memmap_dir}")
+            else:
+                print(f"[dataset] memmap not found in {memmap_dir}, falling back to xarray")
+                self.route_src  = route_da
+                self.dust_src   = dust_da
+                self.use_memmap = False
+        else:
+            self.route_src  = route_da
+            self.dust_src   = dust_da
+            self.use_memmap = False
 
         targets_index = pd.DatetimeIndex(targets.index).normalize()
         self.samples = []
@@ -271,12 +294,21 @@ class PRLazyDataset(Dataset):
 
     def __getitem__(self, idx):
         i, y = self.samples[idx]
-        x_route = torch.from_numpy(
-            self.route_da.isel(time=slice(i, i + self.T_in)).values
-        )   # [T_in, C_r, H_r, W_r]
-        x_dust = torch.from_numpy(
-            self.dust_da.isel(time=slice(i, i + self.T_dust)).values
-        )   # [T_dust, 2, H_d, W_d]
+
+        if self.use_memmap:
+            x_route = torch.from_numpy(
+                self.route_src[i : i + self.T_in].copy()
+            )
+            x_dust = torch.from_numpy(
+                self.dust_src[i : i + self.T_dust].copy()
+            )
+        else:
+            x_route = torch.from_numpy(
+                self.route_src.isel(time=slice(i, i + self.T_in)).values
+            )
+            x_dust = torch.from_numpy(
+                self.dust_src.isel(time=slice(i, i + self.T_dust)).values
+            )
 
         if self.route_mean is not None:
             x_route = (x_route - self.route_mean) / (self.route_std + 1e-6)
@@ -412,9 +444,11 @@ def main():
     # ----------------------------------------------------------
     # Dataset — time-based train / val split (no data leakage)
     # ----------------------------------------------------------
+    memmap_dir = cfg.get("memmap_dir", None)
     full_dataset = PRLazyDataset(
         route_da, dust_da, targets, times, T_IN, T_DUST,
         route_mean, route_std, dust_mean, dust_std,
+        memmap_dir=memmap_dir,
     )
 
     n_val   = max(1, int(len(full_dataset) * cfg["val_frac"]))
