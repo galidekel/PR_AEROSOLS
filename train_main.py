@@ -392,14 +392,6 @@ def main():
     print(f"\nRoute: {route_da.shape}   channels: {len(route_channel_names)}")
     print(f"Dust : {dust_da.shape}")
 
-    # Load full arrays into RAM once (320 GB requested — fits easily).
-    # Without this, every batch triggers NFS reads via dask (~1.8 GB/batch).
-    print("[load] loading route array into RAM ...", flush=True)
-    route_da = route_da.load()
-    print("[load] loading dust array into RAM ...", flush=True)
-    dust_da = dust_da.load()
-    print("[load] done.", flush=True)
-
     # ----------------------------------------------------------
     # AERONET targets
     # ----------------------------------------------------------
