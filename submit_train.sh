@@ -10,8 +10,7 @@ cd $CODE_DIR
 
 if [ ! -f $SCRATCH/route.dat ]; then
     echo "[scratch] memmap not found, running preprocessing..."
-    cp -r $DATA_SRC/era5_dataset $SCRATCH/
-    cp -r $DATA_SRC/cams_dataset $SCRATCH/
+    mkdir -p $SCRATCH
     $PYTHON -u preprocess_memmap.py --config config_hpc.yaml --scratch $SCRATCH
     echo "[scratch] preprocessing done."
 else
