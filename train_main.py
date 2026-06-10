@@ -310,6 +310,9 @@ class PRLazyDataset(Dataset):
                 self.dust_src.isel(time=slice(i, i + self.T_dust)).values
             )
 
+        x_route = torch.nan_to_num(x_route, nan=0.0)
+        x_dust  = torch.nan_to_num(x_dust,  nan=0.0)
+
         if self.route_mean is not None:
             x_route = (x_route - self.route_mean) / (self.route_std + 1e-6)
         if self.dust_mean is not None:
@@ -341,6 +344,7 @@ def run_epoch(model, loader, device, optimizer=None):
             if is_train:
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 print(f"  batch {batch_idx + 1}/{len(loader)}  MSE={loss.item():.4f}")
 
