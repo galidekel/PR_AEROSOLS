@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-AERONET_PATH = "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/20040101_20251231_Cape_San_Juan.tot_lev20"
+AERONET_PATH = "/Users/galidek/PyCharmProjects/PR_Aerosols/PR AEROSOLS DATA/OneDrive_2_02-12-2025/AERONET_20040101_20251231_Cape_San_Juan/20040101_20251231_Cape_San_Juan.tot_lev20"
 
 df = pd.read_csv(AERONET_PATH, skiprows=6)
 df["datetime"] = pd.to_datetime(
