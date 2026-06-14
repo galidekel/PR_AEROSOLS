@@ -156,30 +156,20 @@ def build_dust_dataset(ds_cams):
 # =========================================================
 # 6) AERONET TARGET
 # =========================================================
-def load_aeronet_targets(path):
+def load_aeronet_targets(path, target_col="AOD_500nm-AOD"):
     df = pd.read_csv(path, skiprows=6)
     df["datetime"] = pd.to_datetime(
         df["Date(dd:mm:yyyy)"] + " " + df["Time(hh:mm:ss)"],
         format="%d:%m:%Y %H:%M:%S"
     )
-    for c in ["AOD_440nm-AOD", "AOD_870nm-AOD"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df[["AOD_440nm-AOD", "AOD_870nm-AOD"]] = df[["AOD_440nm-AOD", "AOD_870nm-AOD"]].mask(
-        df[["AOD_440nm-AOD", "AOD_870nm-AOD"]].isin([-999.0, -9999.0])
-    )
+    df[target_col] = pd.to_numeric(df[target_col], errors="coerce")
+    df[target_col] = df[target_col].mask(df[target_col].isin([-999.0, -9999.0]))
     df = df.set_index("datetime")
-    mask = (
-        df["AOD_440nm-AOD"].notna() & df["AOD_870nm-AOD"].notna()
-        & (df["AOD_440nm-AOD"] > 0) & (df["AOD_870nm-AOD"] > 0)
-    )
-    df["AE_440_870"] = np.nan
-    df.loc[mask, "AE_440_870"] = (
-        -np.log(df.loc[mask, "AOD_440nm-AOD"] / df.loc[mask, "AOD_870nm-AOD"])
-        / np.log(440 / 870)
-    )
-    daily = df["AE_440_870"].resample("D").mean().dropna()
+    daily = df[target_col][df[target_col] > 0].resample("D").mean().dropna()
     print(f"[targets] {len(daily)} valid days  "
           f"({daily.index[0].date()} → {daily.index[-1].date()})")
+    print(f"[targets] mean={daily.mean():.4f}  std={daily.std():.4f}  "
+          f"baseline_MSE={daily.var():.4f}")
     return daily
 
 
