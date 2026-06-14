@@ -156,7 +156,7 @@ def build_dust_dataset(ds_cams):
 # =========================================================
 # 6) AERONET TARGET
 # =========================================================
-def load_aeronet_targets(path, target_col="AOD_500nm-AOD"):
+def load_aeronet_targets(path, target_col="AOD_500nm-AOD", agg="median"):
     df = pd.read_csv(path, skiprows=6)
     df["datetime"] = pd.to_datetime(
         df["Date(dd:mm:yyyy)"] + " " + df["Time(hh:mm:ss)"],
@@ -165,10 +165,11 @@ def load_aeronet_targets(path, target_col="AOD_500nm-AOD"):
     df[target_col] = pd.to_numeric(df[target_col], errors="coerce")
     df[target_col] = df[target_col].mask(df[target_col].isin([-999.0, -9999.0]))
     df = df.set_index("datetime")
-    daily = df[target_col][df[target_col] > 0].resample("D").mean().dropna()
+    valid = df[target_col][df[target_col] > 0]
+    daily = getattr(valid.resample("D"), agg)().dropna()
     print(f"[targets] {len(daily)} valid days  "
           f"({daily.index[0].date()} → {daily.index[-1].date()})")
-    print(f"[targets] mean={daily.mean():.4f}  std={daily.std():.4f}  "
+    print(f"[targets] {agg}={daily.mean():.4f}  std={daily.std():.4f}  "
           f"baseline_MSE={daily.var():.4f}")
     return daily
 
@@ -273,7 +274,12 @@ class PRLazyDataset(Dataset):
         targets_index = pd.DatetimeIndex(targets.index).normalize()
         self.samples = []
         for i in range(len(times) - T_in):
-            t_target = pd.Timestamp(times[i + T_in - 1]).normalize()
+            t_end = pd.Timestamp(times[i + T_in - 1])
+            # One sample per day: window ending at 18:00 UTC
+            if t_end.hour != 18:
+                continue
+            # Target is 7 days after the end of the route window
+            t_target = t_end.normalize() + pd.Timedelta(days=7)
             if t_target in targets_index:
                 self.samples.append((i, float(targets.loc[t_target])))
 
