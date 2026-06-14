@@ -278,8 +278,8 @@ class PRLazyDataset(Dataset):
             # One sample per day: window ending at 18:00 UTC
             if t_end.hour != 18:
                 continue
-            # Target is 7 days after the end of the route window
-            t_target = t_end.normalize() + pd.Timedelta(days=7)
+            # Target is the last day of the 7-day route window
+            t_target = t_end.normalize()
             if t_target in targets_index:
                 self.samples.append((i, float(targets.loc[t_target])))
 
