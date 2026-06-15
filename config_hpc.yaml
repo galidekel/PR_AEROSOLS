@@ -4,7 +4,7 @@ cams_dir:  "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/cams_dataset
 aeronet_path: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/20040101_20251231_Cape_San_Juan.tot_lev20"
 norm_stats_path: "norm_stats.json"
 memmap_dir: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/memmap"
-checkpoint_dir: "checkpoints"
+checkpoint_dir: "checkpoints/run2_pos_embed"
 
 # File glob patterns for monthly NetCDF files
 pattern_era5_pl: "era5_pl_*.nc"
