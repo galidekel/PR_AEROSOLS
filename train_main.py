@@ -392,7 +392,7 @@ def main():
     sys.stdout = _Tee(CHECKPOINT_DIR / "train.log")
 
     print(f"[config] loaded from {args.config}")
-    print(f"[log]    writing to {log_path}")
+    print(f"[log]    writing to {CHECKPOINT_DIR / 'train.log'}")
 
     # Unpack config
     ERA5_DIR        = Path(cfg["era5_dir"])
