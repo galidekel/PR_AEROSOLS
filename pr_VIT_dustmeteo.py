@@ -120,6 +120,9 @@ class RouteMeteoEncoder(nn.Module):
         embed_dim=256,
         num_heads_space=1,
         dropout=0.0,
+        T_in: int = 28,
+        H: int = 180,
+        W: int = 480,
     ):
         super().__init__()
         self.channel_names = channel_names
@@ -141,14 +144,13 @@ class RouteMeteoEncoder(nn.Module):
             dropout=dropout,
         )
 
-        self.pos_embed: Optional[nn.Parameter] = None
-        self.pos_shape: Optional[Tuple[int, int, int]] = None
+        Tp = T_in // self.pt
+        Hp = H   // self.py
+        Wp = W   // self.px
+        Nt = Tp * Hp * Wp
+        self.pos_embed = nn.Parameter(torch.randn(1, Nt, embed_dim) * 0.02)
 
     def _get_pos_embed(self, Tp, Hp, Wp, device, dtype):
-        if (self.pos_embed is None) or (self.pos_shape != (Tp, Hp, Wp)):
-            Nt = Tp * Hp * Wp
-            self.pos_embed = nn.Parameter(torch.randn(1, Nt, self.embed_dim) * 0.02)
-            self.pos_shape = (Tp, Hp, Wp)
         return self.pos_embed.to(device=device, dtype=dtype)
 
     def forward(self, X, return_attn=True):
@@ -203,6 +205,9 @@ class PRAfricaDustRouteMeteoNet(nn.Module):
         out_dim=1,
         use_aeronet_at_t=False,
         aeronet_dim=0,
+        T_in: int = 28,
+        H_route: int = 180,
+        W_route: int = 480,
     ):
         super().__init__()
 
@@ -221,6 +226,9 @@ class PRAfricaDustRouteMeteoNet(nn.Module):
             embed_dim=embed_dim,
             num_heads_space=num_heads_space,
             dropout=dropout,
+            T_in=T_in,
+            H=H_route,
+            W=W_route,
         )
 
         self.pr_token = nn.Parameter(torch.randn(1, embed_dim) * 0.02)

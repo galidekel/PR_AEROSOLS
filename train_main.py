@@ -473,6 +473,9 @@ def main():
         num_heads_fusion=cfg["num_heads_fusion"],
         dropout=cfg["dropout"],
         out_dim=cfg["out_dim"],
+        T_in=T_IN,
+        H_route=route_da.shape[2],
+        W_route=route_da.shape[3],
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

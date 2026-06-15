@@ -105,6 +105,9 @@ def main():
         num_heads_fusion=cfg["num_heads_fusion"],
         dropout=cfg["dropout"],
         out_dim=cfg["out_dim"],
+        T_in=cfg["t_in"],
+        H_route=route_da.shape[2],
+        W_route=route_da.shape[3],
     ).to(device)
 
     missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
