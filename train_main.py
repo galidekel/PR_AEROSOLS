@@ -358,16 +358,15 @@ def run_epoch(model, loader, device, optimizer=None):
 # 10) MAIN
 # =========================================================
 class _Tee:
-    """Writes to both stdout and a log file simultaneously."""
-    def __init__(self, log_path):
-        import sys
-        self._stdout = sys.stdout
+    """Writes to both a stream (stdout/stderr) and a log file simultaneously."""
+    def __init__(self, stream, log_path):
+        self._stream = stream
         self._file   = open(log_path, "w", buffering=1)
     def write(self, msg):
-        self._stdout.write(msg)
+        self._stream.write(msg)
         self._file.write(msg)
     def flush(self):
-        self._stdout.flush()
+        self._stream.flush()
         self._file.flush()
 
 
@@ -388,8 +387,8 @@ def main():
     CHECKPOINT_DIR = Path(cfg["checkpoint_dir"])
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Redirect stdout to both terminal and per-run log file
-    sys.stdout = _Tee(CHECKPOINT_DIR / "train.log")
+    sys.stdout = _Tee(sys.stdout, CHECKPOINT_DIR / "train.log")
+    sys.stderr = _Tee(sys.stderr, CHECKPOINT_DIR / "train_err.log")
 
     print(f"[config] loaded from {args.config}")
     print(f"[log]    writing to {CHECKPOINT_DIR / 'train.log'}")
