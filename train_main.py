@@ -39,6 +39,10 @@ def load_config(path="config.yaml"):
         cfg["era5_dir"] = cfg["data_dir"]
         cfg["cams_dir"] = cfg["data_dir"]
 
+    # Derive checkpoint_dir from run_name if present
+    if "run_name" in cfg:
+        cfg["checkpoint_dir"] = f"checkpoints/{cfg['run_name']}"
+
     return cfg
 
 
@@ -353,6 +357,20 @@ def run_epoch(model, loader, device, optimizer=None):
 # =========================================================
 # 10) MAIN
 # =========================================================
+class _Tee:
+    """Writes to both stdout and a log file simultaneously."""
+    def __init__(self, log_path):
+        import sys
+        self._stdout = sys.stdout
+        self._file   = open(log_path, "w", buffering=1)
+    def write(self, msg):
+        self._stdout.write(msg)
+        self._file.write(msg)
+    def flush(self):
+        self._stdout.flush()
+        self._file.flush()
+
+
 def main():
     import sys
     sys.stdout.reconfigure(line_buffering=True)
@@ -362,14 +380,21 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+
+    # Redirect stdout to both terminal and per-run log file
+    CHECKPOINT_DIR = Path(cfg["checkpoint_dir"])
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = CHECKPOINT_DIR / "train.log"
+    sys.stdout = _Tee(log_path)
+
     print(f"[config] loaded from {args.config}")
+    print(f"[log]    writing to {log_path}")
 
     # Unpack config
     ERA5_DIR        = Path(cfg["era5_dir"])
     CAMS_DIR        = Path(cfg["cams_dir"])
     AERONET_PATH    = Path(cfg["aeronet_path"])
     NORM_STATS_PATH = Path(cfg["norm_stats_path"])
-    CHECKPOINT_DIR  = Path(cfg["checkpoint_dir"])
     AREA_ROUTE      = cfg["area_route"]
     AREA_AFRICA     = cfg["area_africa"]
     T_STEP_HOURS    = cfg["t_step_hours"]
@@ -494,7 +519,6 @@ def main():
     # ----------------------------------------------------------
     # Training loop
     # ----------------------------------------------------------
-    CHECKPOINT_DIR.mkdir(exist_ok=True)
     best_val_loss = float("inf")
     num_epochs    = cfg["num_epochs"]
 
