@@ -39,9 +39,9 @@ def load_config(path="config.yaml"):
         cfg["era5_dir"] = cfg["data_dir"]
         cfg["cams_dir"] = cfg["data_dir"]
 
-    # Derive checkpoint_dir from run_name if present
+    # Derive output dir from run_name
     if "run_name" in cfg:
-        cfg["checkpoint_dir"] = f"checkpoints/{cfg['run_name']}"
+        cfg["checkpoint_dir"] = f"outputs/{cfg['run_name']}"
 
     return cfg
 
@@ -376,16 +376,20 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config.yaml", help="Path to YAML config file")
+    parser.add_argument("--config",   default="config.yaml", help="Path to YAML config file")
+    parser.add_argument("--run_name", default=None,          help="Run name (overrides config)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.run_name:
+        cfg["run_name"]       = args.run_name
+        cfg["checkpoint_dir"] = f"outputs/{args.run_name}"
 
-    # Redirect stdout to both terminal and per-run log file
     CHECKPOINT_DIR = Path(cfg["checkpoint_dir"])
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = CHECKPOINT_DIR / "train.log"
-    sys.stdout = _Tee(log_path)
+
+    # Redirect stdout to both terminal and per-run log file
+    sys.stdout = _Tee(CHECKPOINT_DIR / "train.log")
 
     print(f"[config] loaded from {args.config}")
     print(f"[log]    writing to {log_path}")
