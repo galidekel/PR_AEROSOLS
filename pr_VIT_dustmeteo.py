@@ -147,11 +147,25 @@ class RouteMeteoEncoder(nn.Module):
         Tp = T_in // self.pt
         Hp = H   // self.py
         Wp = W   // self.px
-        Nt = Tp * Hp * Wp
-        self.pos_embed = nn.Parameter(torch.randn(1, Nt, embed_dim) * 0.02)
+        self.Tp, self.Hp, self.Wp = Tp, Hp, Wp
+
+        self.time_embed    = nn.Embedding(Tp, embed_dim)
+        self.lat_embed     = nn.Embedding(Hp, embed_dim)
+        self.lon_embed     = nn.Embedding(Wp, embed_dim)
+
+        # Pre-compute flat position indices — registered as buffer (no grad, moves with device)
+        t_idx = torch.arange(Tp).repeat_interleave(Hp * Wp)
+        h_idx = torch.arange(Hp).repeat(Tp).repeat_interleave(Wp)
+        w_idx = torch.arange(Wp).repeat(Tp * Hp)
+        self.register_buffer("t_idx", t_idx)
+        self.register_buffer("h_idx", h_idx)
+        self.register_buffer("w_idx", w_idx)
 
     def _get_pos_embed(self, Tp, Hp, Wp, device, dtype):
-        return self.pos_embed.to(device=device, dtype=dtype)
+        pos = (self.time_embed(self.t_idx) +
+               self.lat_embed(self.h_idx) +
+               self.lon_embed(self.w_idx))   # [Nt, D]
+        return pos.unsqueeze(0).to(dtype=dtype)  # [1, Nt, D]
 
     def forward(self, X, return_attn=True):
         # X: [B, T, C, H, W]

@@ -354,6 +354,9 @@ def run_epoch(model, loader, device, optimizer=None):
 # 10) MAIN
 # =========================================================
 def main():
+    import sys
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config file")
     args = parser.parse_args()
