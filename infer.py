@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import torch
@@ -22,6 +23,10 @@ from train_main import (
 from pathlib import Path
 
 
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", default="checkpoints/best.pt")
@@ -34,12 +39,12 @@ def main():
 
     cfg = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[device] {device}")
+    log(f"device={device}")
 
     # ── Load checkpoint ────────────────────────────────────────────────────────
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     route_channel_names = ckpt["route_channel_names"]
-    print(f"[ckpt] epoch={ckpt['epoch']}  val_loss={ckpt['val_loss']:.6f}")
+    log(f"ckpt epoch={ckpt['epoch']}  val_loss={ckpt['val_loss']:.6f}")
 
     # ── Data pipeline (mirrors train_main.py exactly) ─────────────────────────
     ERA5_DIR = Path(cfg["era5_dir"])
@@ -47,11 +52,11 @@ def main():
     chunks   = {"time": cfg["chunk_time"]}
     T_STEP   = cfg["t_step_hours"]
 
-    print("\n--- LOADING ERA5 PL ---")
+    log("loading ERA5 PL ...")
     ds_pl = load_all_files(ERA5_DIR, cfg["pattern_era5_pl"], chunks=chunks)
-    print("\n--- LOADING ERA5 SL ---")
+    log("loading ERA5 SL ...")
     ds_sl = load_all_files(ERA5_DIR, cfg["pattern_era5_sl"], chunks=chunks)
-    print("\n--- LOADING CAMS ---")
+    log("loading CAMS ...")
     ds_cams = load_all_files(CAMS_DIR, cfg["pattern_cams"], chunks=chunks)
 
     ds_pl_route    = crop_area(ds_pl,   cfg["area_route"])
@@ -87,7 +92,7 @@ def main():
     n_val   = max(1, int(len(full_dataset) * cfg["val_frac"]))
     n_train = len(full_dataset) - n_val
     val_ds  = Subset(full_dataset, range(n_train, len(full_dataset)))
-    print(f"\n[split] total={len(full_dataset)}  train={n_train}  val={len(val_ds)}")
+    log(f"split: total={len(full_dataset)}  train={n_train}  val={len(val_ds)}")
 
     val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"], shuffle=False, num_workers=0)
 
@@ -102,8 +107,13 @@ def main():
         out_dim=cfg["out_dim"],
     ).to(device)
 
-    model.load_state_dict(ckpt["model_state"])
+    missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+    if unexpected:
+        log(f"ignored keys not in model: {unexpected}")
+    if missing:
+        log(f"missing keys (will use random init): {missing}")
     model.eval()
+    log("model loaded — starting inference")
 
     # ── Collect dates for each val sample ─────────────────────────────────────
     T_IN = cfg["t_in"]
@@ -150,13 +160,13 @@ def main():
     baseline_mse = float(((all_targets - all_targets.mean()) ** 2).mean())
     r2 = 1.0 - overall_mse / (baseline_mse + 1e-9)
 
+    log(f"inference done — {len(all_preds)} samples")
     print("-" * 80)
-    print(f"\n[summary over {len(all_preds)} samples]")
-    print(f"  pred  min={all_preds.min():.4f}  max={all_preds.max():.4f}  "
-          f"mean={all_preds.mean():.4f}  std={all_preds.std():.4f}")
-    print(f"  tgt   min={all_targets.min():.4f}  max={all_targets.max():.4f}  "
-          f"mean={all_targets.mean():.4f}  std={all_targets.std():.4f}")
-    print(f"  MSE={overall_mse:.4f}  baseline_MSE={baseline_mse:.4f}  R²={r2:.4f}")
+    log(f"pred  min={all_preds.min():.4f}  max={all_preds.max():.4f}  "
+        f"mean={all_preds.mean():.4f}  std={all_preds.std():.4f}")
+    log(f"tgt   min={all_targets.min():.4f}  max={all_targets.max():.4f}  "
+        f"mean={all_targets.mean():.4f}  std={all_targets.std():.4f}")
+    log(f"MSE={overall_mse:.4f}  baseline_MSE={baseline_mse:.4f}  R²={r2:.4f}")
 
     # ── Save CSV ───────────────────────────────────────────────────────────────
     out_path = Path(args.out)
@@ -165,7 +175,7 @@ def main():
         "pred":   all_preds,
         "target": all_targets,
     }).to_csv(out_path, index=False)
-    print(f"\n[saved] {out_path}  ({len(all_preds)} rows)")
+    log(f"saved {out_path}  ({len(all_preds)} rows)")
 
 
 if __name__ == "__main__":
