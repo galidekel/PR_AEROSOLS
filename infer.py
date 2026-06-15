@@ -4,6 +4,7 @@ Inference on the val split using a saved checkpoint.
 Usage:
     python infer.py --checkpoint checkpoints/best.pt --config config_hpc.yaml
     python infer.py --checkpoint checkpoints/best.pt --config config_hpc.yaml --n_batches 20
+    python infer.py --checkpoint checkpoints/best.pt --config config_hpc.yaml --out results.csv
 """
 
 import argparse
@@ -25,8 +26,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", default="checkpoints/best.pt")
     parser.add_argument("--config",     default="config_hpc.yaml")
-    parser.add_argument("--n_batches",  type=int, default=10,
-                        help="Number of batches to print (0 = all)")
+    parser.add_argument("--n_batches",  type=int, default=0,
+                        help="Number of batches to run (0 = all val set)")
+    parser.add_argument("--out",        default="infer_results.csv",
+                        help="Path to save predictions CSV")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -102,8 +105,15 @@ def main():
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
+    # ── Collect dates for each val sample ─────────────────────────────────────
+    T_IN = cfg["t_in"]
+    val_dates = [
+        pd.Timestamp(times[full_dataset.samples[n_train + k][0] + T_IN - 1]).normalize()
+        for k in range(len(val_ds))
+    ]
+
     # ── Inference ─────────────────────────────────────────────────────────────
-    all_preds, all_targets = [], []
+    all_preds, all_targets, all_dates = [], [], []
     limit = args.n_batches if args.n_batches > 0 else len(val_loader)
 
     print(f"\n{'Batch':>5}  {'pred_min':>9} {'pred_max':>9} {'pred_mean':>10} "
@@ -121,6 +131,9 @@ def main():
             y_hat = model(x_dust, x_route, return_attn=False)
             preds = y_hat.squeeze(-1).cpu().numpy()
             tgts  = y.numpy()
+
+            start = batch_idx * cfg["batch_size"]
+            all_dates.extend(val_dates[start : start + len(preds)])
 
             mse = float(((preds - tgts) ** 2).mean())
             print(f"{batch_idx+1:>5}  "
@@ -144,6 +157,15 @@ def main():
     print(f"  tgt   min={all_targets.min():.4f}  max={all_targets.max():.4f}  "
           f"mean={all_targets.mean():.4f}  std={all_targets.std():.4f}")
     print(f"  MSE={overall_mse:.4f}  baseline_MSE={baseline_mse:.4f}  R²={r2:.4f}")
+
+    # ── Save CSV ───────────────────────────────────────────────────────────────
+    out_path = Path(args.out)
+    pd.DataFrame({
+        "date":   [d.date() for d in all_dates],
+        "pred":   all_preds,
+        "target": all_targets,
+    }).to_csv(out_path, index=False)
+    print(f"\n[saved] {out_path}  ({len(all_preds)} rows)")
 
 
 if __name__ == "__main__":
