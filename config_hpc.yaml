@@ -30,7 +30,7 @@ embed_dim:        256
 num_heads_space:  4
 num_heads_fusion: 4
 dropout:          0.1
-out_dim:          1             # regression: scalar AE 440-870
+out_dim:          1             # regression: scalar AOD_500nm
 
 # ── Training ──────────────────────────────────────────────────────────────────
 batch_size:   4
