@@ -361,7 +361,7 @@ class _Tee:
     """Writes to both a stream (stdout/stderr) and a log file simultaneously."""
     def __init__(self, stream, log_path):
         self._stream = stream
-        self._file   = open(log_path, "w", buffering=1)
+        self._file   = open(log_path, "a", buffering=1)
     def write(self, msg):
         self._stream.write(msg)
         self._file.write(msg)
@@ -389,6 +389,8 @@ def main():
 
     sys.stdout = _Tee(sys.stdout, CHECKPOINT_DIR / "train.log")
     sys.stderr = _Tee(sys.stderr, CHECKPOINT_DIR / "train_err.log")
+    from datetime import datetime
+    print(f"\n{'='*60}\nRun started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'='*60}")
 
     print(f"[config] loaded from {args.config}")
     print(f"[log]    writing to {CHECKPOINT_DIR / 'train.log'}")
