@@ -127,6 +127,7 @@ def main():
 
     # ── Inference ─────────────────────────────────────────────────────────────
     all_preds, all_targets, all_dates = [], [], []
+    all_cams_total, all_cams_dust = [], []
     limit = args.n_batches if args.n_batches > 0 else len(val_loader)
 
     print(f"\n{'Batch':>5}  {'pred_min':>9} {'pred_max':>9} {'pred_mean':>10} "
@@ -145,6 +146,13 @@ def main():
             preds = y_hat.squeeze(-1).cpu().numpy()
             tgts  = y.numpy()
 
+            # De-normalize the dust input and average over time+space per
+            # sample, so we can compare the raw CAMS signal to pred/target.
+            x_dust_raw = x_dust.cpu() * dust_std + dust_mean
+            cams_mean = x_dust_raw.mean(dim=(1, 3, 4)).numpy()  # [B, 2]
+            all_cams_total.append(cams_mean[:, 0])
+            all_cams_dust.append(cams_mean[:, 1])
+
             start = batch_idx * cfg["batch_size"]
             all_dates.extend(val_dates[start : start + len(preds)])
 
@@ -159,6 +167,8 @@ def main():
 
     all_preds   = np.concatenate(all_preds)
     all_targets = np.concatenate(all_targets)
+    all_cams_total = np.concatenate(all_cams_total)
+    all_cams_dust  = np.concatenate(all_cams_dust)
     overall_mse  = float(((all_preds - all_targets) ** 2).mean())
     baseline_mse = float(((all_targets - all_targets.mean()) ** 2).mean())
     r2 = 1.0 - overall_mse / (baseline_mse + 1e-9)
@@ -174,9 +184,11 @@ def main():
     # ── Save CSV ───────────────────────────────────────────────────────────────
     out_path = Path(args.out)
     pd.DataFrame({
-        "date":   [d.date() for d in all_dates],
-        "pred":   all_preds,
-        "target": all_targets,
+        "date":             [d.date() for d in all_dates],
+        "pred":             all_preds,
+        "target":           all_targets,
+        "cams_total_aod":   all_cams_total,
+        "cams_dust_aod":    all_cams_dust,
     }).to_csv(out_path, index=False)
     log(f"saved {out_path}  ({len(all_preds)} rows)")
 
