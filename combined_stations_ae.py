@@ -24,7 +24,7 @@ df_csj.columns = ["AOD_440", "AOD_500", "AOD_870"]
 
 # ── Load NEON GUAN ───────────────────────────────────────────────────────────
 df_ng = pd.read_csv(
-    'PR AEROSOLS DATA/OneDrive_2_02-12-2025/AERONET_NEON_GUAN/NEON_GUAN_all_years_lev20_daily.txt',
+    'NEON_GUAN_all_years_lev20_daily.txt',
     skiprows=5
 )
 df_ng["datetime"] = pd.to_datetime(
@@ -40,7 +40,7 @@ df_ng.columns = ["AOD_440", "AOD_500", "AOD_870"]
 
 # ── Load La Parguera ──────────────────────────────────────────────────────────
 df_lp = pd.read_csv(
-    'PR AEROSOLS DATA/OneDrive_2_02-12-2025/AERONET_La_Parguera/La_Parguera_all_years_lev20_daily.txt',
+    'La_Parguera_all_years_lev20_daily.txt',
     skiprows=5
 )
 df_lp["datetime"] = pd.to_datetime(

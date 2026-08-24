@@ -1,9 +1,38 @@
 # ── Paths ────────────────────────────────────────────────────────────────────
 era5_dir:  "."
 cams_dir:  "."
-aeronet_path: "PR AEROSOLS DATA/OneDrive_2_02-12-2025/AERONET_20040101_20251231_Cape_San_Juan/20040101_20251231_Cape_San_Juan.tot_lev20"
 norm_stats_path: "norm_stats.json"
 checkpoint_dir: "checkpoints"
+target_agg: "median"   # daily aggregation for tot_lev20-format stations: mean | median
+
+# ── AERONET stations ─────────────────────────────────────────────────────────
+# See config.yaml for the full explanation. Exactly one "primary" station
+# (used at inference); "auxiliary" stations only enrich the shared backbone.
+stations:
+  - name: "Cape_San_Juan"
+    role: "primary"
+    format: "tot_lev20"
+    path: "PR AEROSOLS DATA/OneDrive_2_02-12-2025/AERONET_20040101_20251231_Cape_San_Juan/20040101_20251231_Cape_San_Juan.tot_lev20"
+    target_col: "AOD_500nm-AOD"
+    lat: 18.3845
+    lon: -65.6199
+    elev: 15.0
+  - name: "La_Parguera"
+    role: "auxiliary"
+    format: "daily_lev20"
+    path: "PR AEROSOLS DATA/OneDrive_2_02-12-2025/AERONET_La_Parguera/La_Parguera_all_years_lev20_daily.txt"
+    target_col: "AOD_500nm"
+    lat: 17.9705
+    lon: -67.0454
+    elev: 12.4
+  - name: "NEON_GUAN"
+    role: "auxiliary"
+    format: "daily_lev20"
+    path: "PR AEROSOLS DATA/OneDrive_2_02-12-2025/AERONET_NEON_GUAN/NEON_GUAN_all_years_lev20_daily.txt"
+    target_col: "AOD_500nm"
+    lat: 17.9696
+    lon: -66.8687
+    elev: 128.0
 
 # File glob patterns for monthly NetCDF files
 pattern_era5_pl: "era5_pl_*.nc"

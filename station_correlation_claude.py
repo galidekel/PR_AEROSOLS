@@ -35,8 +35,8 @@ def load_api(path):
     return df["AE"].resample("D").median().dropna()
 
 csj = load_csj().rename("CSJ")
-ng  = load_api('PR AEROSOLS DATA/OneDrive_2_02-12-2025/AERONET_NEON_GUAN/NEON_GUAN_all_years_lev20_daily.txt').rename("NG")
-lp  = load_api('PR AEROSOLS DATA/OneDrive_2_02-12-2025/AERONET_La_Parguera/La_Parguera_all_years_lev20_daily.txt').rename("LP")
+ng  = load_api('NEON_GUAN_all_years_lev20_daily.txt').rename("NG")
+lp  = load_api('La_Parguera_all_years_lev20_daily.txt').rename("LP")
 
 pairs = [
     (ng,  csj, "NEON Guánica",  "Cape San Juan", "#d94801", "#08519c"),

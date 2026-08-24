@@ -8,7 +8,7 @@ import matplotlib.dates as mdates
 
 # --- Read file ---
 df = pd.read_csv(
-    "PR AEROSOLS DATA/OneDrive_2_02-12-2025/AERONET_NEON_GUAN/NEON_GUAN_all_years_lev20_daily.txt",
+    "NEON_GUAN_all_years_lev20_daily.txt",
     skiprows=5
 )
 
