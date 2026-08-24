@@ -3,7 +3,7 @@ era5_dir:  "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/era5_dataset
 cams_dir:  "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/cams_dataset"
 norm_stats_path: "norm_stats.json"
 memmap_dir: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/memmap"
-run_name: "run2"
+run_name: "run_3_stations_"
 target_agg: "median"   # daily aggregation for tot_lev20-format stations: mean | median
 
 # ── AERONET stations ─────────────────────────────────────────────────────────
