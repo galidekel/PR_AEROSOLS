@@ -39,6 +39,31 @@ def load_config(path="config.yaml"):
         cfg["era5_dir"] = cfg["data_dir"]
         cfg["cams_dir"] = cfg["data_dir"]
 
+    # ── AERONET stations ────────────────────────────────────────────────
+    # New schema: cfg["stations"] is a list of
+    #   {name, role: "primary"|"auxiliary", format: "tot_lev20"|"daily_lev20",
+    #    path, target_col, lat, lon, elev}
+    # Exactly one station must have role == "primary" — that's the only
+    # head ever used at inference/eval; "auxiliary" stations only enrich
+    # the shared backbone during training (see PRAfricaDustRouteMeteoNet
+    # docstring). Falls back to a single-primary-station list built from
+    # the old aeronet_path/target_col keys if "stations" isn't present, so
+    # older configs keep working unchanged.
+    if "stations" not in cfg:
+        cfg["stations"] = [{
+            "name": "Cape_San_Juan",
+            "role": "primary",
+            "format": "tot_lev20",
+            "path": cfg["aeronet_path"],
+            "target_col": cfg.get("target_col", "AOD_500nm-AOD"),
+            "lat": 18.3845, "lon": -65.6199, "elev": 15.0,
+        }]
+    primary = [s for s in cfg["stations"] if s.get("role", "primary") == "primary"]
+    if len(primary) != 1:
+        raise ValueError(f"Expected exactly one primary station, found {len(primary)}: "
+                          f"{[s['name'] for s in primary]}")
+    cfg["inference_station"] = primary[0]["name"]
+
     # Derive output dir from run_name
     if "run_name" in cfg:
         cfg["checkpoint_dir"] = f"outputs/{cfg['run_name']}"
@@ -161,6 +186,7 @@ def build_dust_dataset(ds_cams):
 # 6) AERONET TARGET
 # =========================================================
 def load_aeronet_targets(path, target_col="AOD_500nm-AOD", agg="median"):
+    """Sub-daily, all-points '.tot_lev20' export — aggregated to one value/day."""
     df = pd.read_csv(path, skiprows=6)
     df["datetime"] = pd.to_datetime(
         df["Date(dd:mm:yyyy)"] + " " + df["Time(hh:mm:ss)"],
@@ -171,9 +197,47 @@ def load_aeronet_targets(path, target_col="AOD_500nm-AOD", agg="median"):
     df = df.set_index("datetime")
     valid = df[target_col][df[target_col] > 0]
     daily = getattr(valid.resample("D"), agg)().dropna()
-    print(f"[targets] {len(daily)} valid days  "
-          f"({daily.index[0].date()} → {daily.index[-1].date()})")
-    print(f"[targets] {agg}={daily.mean():.4f}  std={daily.std():.4f}  "
+    return daily
+
+
+def load_aeronet_targets_daily(path, target_col="AOD_500nm", agg="median"):
+    """AERONET's own '*_all_years_lev20_daily.txt' export — already one row/day.
+
+    Still grouped by calendar day (not just indexed) in case a date repeats
+    (e.g. overlapping instrument deployments).
+    """
+    df = pd.read_csv(path, skiprows=5)
+    df.columns = [c.strip() for c in df.columns]
+    date_col = [c for c in df.columns if c.startswith("Date")][0]
+    df["datetime"] = pd.to_datetime(df[date_col], format="%d:%m:%Y")
+    df[target_col] = pd.to_numeric(df[target_col], errors="coerce")
+    df[target_col] = df[target_col].mask(df[target_col].isin([-999.0, -9999.0]))
+    df = df.set_index("datetime")
+    valid = df[target_col][df[target_col] > 0]
+    daily = getattr(valid.resample("D"), agg)().dropna()
+    return daily
+
+
+_AERONET_PARSERS = {
+    "tot_lev20":   load_aeronet_targets,
+    "daily_lev20": load_aeronet_targets_daily,
+}
+
+
+def load_station_targets(station_cfg, default_agg="median"):
+    """Dispatches to the right parser based on station_cfg['format'], prints a summary."""
+    fmt = station_cfg.get("format", "tot_lev20")
+    agg = station_cfg.get("target_agg", default_agg)
+    col = station_cfg.get("target_col", "AOD_500nm-AOD" if fmt == "tot_lev20" else "AOD_500nm")
+    parser = _AERONET_PARSERS.get(fmt)
+    if parser is None:
+        raise ValueError(f"Unknown AERONET format {fmt!r} for station {station_cfg['name']!r}; "
+                          f"expected one of {list(_AERONET_PARSERS)}")
+
+    daily = parser(station_cfg["path"], target_col=col, agg=agg)
+    print(f"[targets:{station_cfg['name']}] {len(daily)} valid days  "
+          f"({daily.index[0].date()} → {daily.index[-1].date()})  fmt={fmt}")
+    print(f"[targets:{station_cfg['name']}] {agg}={daily.mean():.4f}  std={daily.std():.4f}  "
           f"baseline_MSE={daily.var():.4f}")
     return daily
 
@@ -242,7 +306,10 @@ class PRLazyDataset(Dataset):
         route_mean=None, route_std=None,
         dust_mean=None,  dust_std=None,
         memmap_dir=None,
+        station_name="",
+        max_target_date=None,   # exclusive upper bound (pd.Timestamp) — see leakage note below
     ):
+        self.station_name = station_name
         self.T_in       = T_in
         self.T_dust     = T_dust
         self.route_mean = route_mean
@@ -277,6 +344,8 @@ class PRLazyDataset(Dataset):
 
         targets_index = pd.DatetimeIndex(targets.index).normalize()
         self.samples = []
+        self.sample_dates = []   # parallel list — chronological split cutoffs need the actual dates
+        n_skipped_leakage = 0
         for i in range(len(times) - T_in):
             t_end = pd.Timestamp(times[i + T_in - 1])
             # One sample per day: window ending at 18:00 UTC
@@ -284,10 +353,25 @@ class PRLazyDataset(Dataset):
                 continue
             # Target is the last day of the 7-day route window
             t_target = t_end.normalize()
-            if t_target in targets_index:
-                self.samples.append((i, float(targets.loc[t_target])))
+            if t_target not in targets_index:
+                continue
+            # Leakage guard: the input tensor for a given day is identical
+            # across stations (same shared regional fields), so a sample
+            # dated inside the primary station's held-out val window would
+            # let the shared backbone see that day during training anyway —
+            # silently invalidating the val split. `max_target_date` is set
+            # to the primary station's train/val cutoff for every OTHER
+            # station's dataset (see main()); the primary's own dataset
+            # passes None here and is split by index afterwards instead.
+            if max_target_date is not None and t_target >= max_target_date:
+                n_skipped_leakage += 1
+                continue
+            self.samples.append((i, float(targets.loc[t_target])))
+            self.sample_dates.append(t_target)
 
-        print(f"[dataset] {len(self.samples)} valid samples")
+        label = f":{station_name}" if station_name else ""
+        print(f"[dataset{label}] {len(self.samples)} valid samples"
+              + (f"  ({n_skipped_leakage} dropped to avoid val leakage)" if n_skipped_leakage else ""))
 
     def __len__(self):
         return len(self.samples)
@@ -324,8 +408,26 @@ class PRLazyDataset(Dataset):
 # =========================================================
 # 9) TRAINING
 # =========================================================
-def run_epoch(model, loader, device, optimizer=None):
-    """Single train or eval pass. Pass optimizer=None for validation."""
+def _step(model, station, x_route, x_dust, y, device, optimizer):
+    """One forward(+backward) pass through a single station's head. Returns (loss_value, batch_size)."""
+    x_route = x_route.to(device, non_blocking=True)  # [B, T_in, C_r, H, W]
+    x_dust  = x_dust.to(device, non_blocking=True)    # [B, T_dust, 2, H_d, W_d]
+    y       = y.to(device, non_blocking=True)          # [B]
+
+    y_hat = model(x_dust, x_route, station=station, return_attn=False)  # [B, 1]
+    loss  = F.mse_loss(y_hat.squeeze(-1), y)
+
+    if optimizer is not None:
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+    return loss.item(), len(y)
+
+
+def run_epoch(model, loader, device, station, optimizer=None):
+    """Single-station train or eval pass. Pass optimizer=None for validation."""
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
@@ -333,23 +435,52 @@ def run_epoch(model, loader, device, optimizer=None):
     ctx = torch.enable_grad() if is_train else torch.no_grad()
 
     with ctx:
-        for batch_idx, (x_route, x_dust, y) in enumerate(tqdm(loader, desc="train" if is_train else "val", leave=False)):
-            x_route = x_route.to(device, non_blocking=True)  # [B, T_in, C_r, H, W]
-            x_dust  = x_dust.to(device, non_blocking=True)   # [B, T_dust, 2, H_d, W_d]
-            y       = y.to(device, non_blocking=True)         # [B]
-
-            y_hat = model(x_dust, x_route, return_attn=False)  # [B, 1]
-            loss  = F.mse_loss(y_hat.squeeze(-1), y)
-
+        for batch_idx, (x_route, x_dust, y) in enumerate(
+            tqdm(loader, desc=f"{'train' if is_train else 'val'}:{station}", leave=False)
+        ):
+            loss_val, bs = _step(model, station, x_route, x_dust, y, device, optimizer)
             if is_train:
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                print(f"  batch {batch_idx + 1}/{len(loader)}  MSE={loss.item():.4f}")
+                print(f"  [{station}] batch {batch_idx + 1}/{len(loader)}  MSE={loss_val:.4f}")
+            total_loss += loss_val * bs
+            n += bs
 
-            total_loss += loss.item() * len(y)
-            n += len(y)
+    return total_loss / n
+
+
+def _cyclic(loader):
+    while True:
+        for batch in loader:
+            yield batch
+
+
+def run_multitask_train_epoch(model, primary_name, primary_loader, aux_loaders, device, optimizer):
+    """
+    One epoch = one full pass over the primary station's train loader. For
+    every primary batch, also draws one batch from each auxiliary station's
+    loader (cycling — auxiliary loaders are usually shorter than the
+    primary one) so the shared backbone gets interleaved multi-task
+    gradient updates rather than one long pass per station. Auxiliary
+    losses are logged but not returned — only the primary station's loss
+    is meaningful for model selection (it's the only head used at
+    inference).
+    """
+    model.train()
+    aux_iters = {name: _cyclic(loader) for name, loader in aux_loaders.items()}
+
+    total_loss, n = 0.0, 0
+    pbar = tqdm(primary_loader, desc=f"train:{primary_name}(+aux)", leave=False)
+    for batch_idx, (x_route, x_dust, y) in enumerate(pbar):
+        loss_val, bs = _step(model, primary_name, x_route, x_dust, y, device, optimizer)
+        total_loss += loss_val * bs
+        n += bs
+        log = f"  [{primary_name}] batch {batch_idx + 1}/{len(primary_loader)}  MSE={loss_val:.4f}"
+
+        for name, it in aux_iters.items():
+            xr_, xd_, y_ = next(it)
+            aux_loss, _ = _step(model, name, xr_, xd_, y_, device, optimizer)
+            log += f"  |  [{name}] MSE={aux_loss:.4f}"
+
+        print(log)
 
     return total_loss / n
 
@@ -396,10 +527,14 @@ def main():
     print(f"[log]    writing to {CHECKPOINT_DIR / 'train.log'}")
 
     # Unpack config
-    ERA5_DIR        = Path(cfg["era5_dir"])
-    CAMS_DIR        = Path(cfg["cams_dir"])
-    AERONET_PATH    = Path(cfg["aeronet_path"])
-    NORM_STATS_PATH = Path(cfg["norm_stats_path"])
+    ERA5_DIR         = Path(cfg["era5_dir"])
+    CAMS_DIR         = Path(cfg["cams_dir"])
+    NORM_STATS_PATH  = Path(cfg["norm_stats_path"])
+    STATIONS         = cfg["stations"]
+    PRIMARY_NAME     = cfg["inference_station"]
+    STATION_NAMES    = [s["name"] for s in STATIONS]
+    print(f"[stations] primary={PRIMARY_NAME!r}  "
+          f"auxiliary={[n for n in STATION_NAMES if n != PRIMARY_NAME]}")
     AREA_ROUTE      = cfg["area_route"]
     AREA_AFRICA     = cfg["area_africa"]
     T_STEP_HOURS    = cfg["t_step_hours"]
@@ -458,9 +593,12 @@ def main():
     print(f"Dust : {dust_da.shape}")
 
     # ----------------------------------------------------------
-    # AERONET targets
+    # AERONET targets — one daily series per station
     # ----------------------------------------------------------
-    targets = load_aeronet_targets(AERONET_PATH)
+    station_targets = {
+        s["name"]: load_station_targets(s, default_agg=cfg.get("target_agg", "median"))
+        for s in STATIONS
+    }
 
     # ----------------------------------------------------------
     # Norm stats — compute once, cache to JSON
@@ -475,31 +613,52 @@ def main():
         save_norm_stats(NORM_STATS_PATH, route_mean, route_std, dust_mean, dust_std)
 
     # ----------------------------------------------------------
-    # Dataset — time-based train / val split (no data leakage)
+    # Dataset — chronological train / val split, computed ONLY on the
+    # primary station's timeline (as before). Auxiliary stations then get
+    # every sample strictly before the resulting cutoff date — never the
+    # val-window dates — since the input tensor for a given day is shared
+    # across stations and would otherwise leak into the backbone before
+    # the primary val pass is supposed to see it as unseen.
     # ----------------------------------------------------------
     memmap_dir = cfg.get("memmap_dir", None)
-    full_dataset = PRLazyDataset(
-        route_da, dust_da, targets, times, T_IN, T_DUST,
+
+    primary_full = PRLazyDataset(
+        route_da, dust_da, station_targets[PRIMARY_NAME], times, T_IN, T_DUST,
         route_mean, route_std, dust_mean, dust_std,
-        memmap_dir=memmap_dir,
+        memmap_dir=memmap_dir, station_name=PRIMARY_NAME,
     )
 
-    n_val   = max(1, int(len(full_dataset) * cfg["val_frac"]))
-    n_train = len(full_dataset) - n_val
-    train_ds = Subset(full_dataset, range(n_train))
-    val_ds   = Subset(full_dataset, range(n_train, len(full_dataset)))
-    print(f"[split] train={len(train_ds)}  val={len(val_ds)}")
+    n_val   = max(1, int(len(primary_full) * cfg["val_frac"]))
+    n_train = len(primary_full) - n_val
+    train_ds = Subset(primary_full, range(n_train))
+    val_ds   = Subset(primary_full, range(n_train, len(primary_full)))
+    cutoff_date = primary_full.sample_dates[n_train]   # first val date — aux training stays strictly before this
+    print(f"[split] primary train={len(train_ds)}  val={len(val_ds)}  cutoff={cutoff_date.date()}")
 
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True,
                               num_workers=0, pin_memory=device.type == "cuda")
     val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"], shuffle=False,
                               num_workers=0, pin_memory=device.type == "cuda")
 
+    aux_loaders = {}
+    for s in STATIONS:
+        if s["name"] == PRIMARY_NAME:
+            continue
+        aux_ds = PRLazyDataset(
+            route_da, dust_da, station_targets[s["name"]], times, T_IN, T_DUST,
+            route_mean, route_std, dust_mean, dust_std,
+            memmap_dir=memmap_dir, station_name=s["name"], max_target_date=cutoff_date,
+        )
+        aux_loaders[s["name"]] = DataLoader(aux_ds, batch_size=cfg["batch_size"], shuffle=True,
+                                            num_workers=0, pin_memory=device.type == "cuda")
+
     # ----------------------------------------------------------
-    # Model
+    # Model — shared backbone, one regression head per station. Only
+    # heads[PRIMARY_NAME] is ever used for validation/inference.
     # ----------------------------------------------------------
     model = PRAfricaDustRouteMeteoNet(
         route_channel_names=route_channel_names,
+        station_names=STATION_NAMES,
         route_patch_size=ROUTE_PATCH_SIZE,
         embed_dim=cfg["embed_dim"],
         num_heads_space=cfg["num_heads_space"],
@@ -528,13 +687,29 @@ def main():
     num_epochs    = cfg["num_epochs"]
 
     for epoch in range(1, num_epochs + 1):
-        train_loss = run_epoch(model, train_loader, device, optimizer=optimizer)
-        val_loss   = run_epoch(model, val_loader,   device, optimizer=None)
+        train_loss = run_multitask_train_epoch(
+            model, PRIMARY_NAME, train_loader, aux_loaders, device, optimizer
+        )
+        val_loss = run_epoch(model, val_loader, device, station=PRIMARY_NAME, optimizer=None)
         scheduler.step()
 
         lr_now = scheduler.get_last_lr()[0]
         print(f"Epoch {epoch:3d}/{num_epochs}  "
               f"train_MSE={train_loss:.4f}  val_MSE={val_loss:.4f}  lr={lr_now:.2e}")
+
+        if epoch == 1:
+            ckpt_e1 = CHECKPOINT_DIR / "epoch1.pt"
+            torch.save({
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "val_loss": val_loss,
+                "route_channel_names": route_channel_names,
+                "station_names": STATION_NAMES,
+                "inference_station": PRIMARY_NAME,
+                "config": cfg,
+            }, ckpt_e1)
+            print(f"           ✓ saved epoch-1 checkpoint")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -545,6 +720,8 @@ def main():
                 "optimizer_state": optimizer.state_dict(),
                 "val_loss": val_loss,
                 "route_channel_names": route_channel_names,
+                "station_names": STATION_NAMES,
+                "inference_station": PRIMARY_NAME,
                 "config": cfg,
             }, ckpt)
             print(f"           ✓ saved best checkpoint (val_MSE={val_loss:.4f})")

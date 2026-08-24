@@ -18,7 +18,7 @@ from pr_VIT_dustmeteo import PRAfricaDustRouteMeteoNet
 from train_main import (
     load_config, load_all_files, load_norm_stats,
     crop_area, build_route_dataset, build_dust_dataset,
-    load_aeronet_targets, PRLazyDataset,
+    load_station_targets, PRLazyDataset,
 )
 from pathlib import Path
 
@@ -44,7 +44,12 @@ def main():
     # ── Load checkpoint ────────────────────────────────────────────────────────
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     route_channel_names = ckpt["route_channel_names"]
-    log(f"ckpt epoch={ckpt['epoch']}  val_loss={ckpt['val_loss']:.6f}")
+    inference_station = ckpt.get("inference_station", cfg["inference_station"])
+    station_names = ckpt.get("station_names", [inference_station])
+    log(f"ckpt epoch={ckpt['epoch']}  val_loss={ckpt['val_loss']:.6f}  "
+        f"inference_station={inference_station!r}")
+
+    primary_cfg = next(s for s in cfg["stations"] if s["name"] == inference_station)
 
     # ── Data pipeline (mirrors train_main.py exactly) ─────────────────────────
     ERA5_DIR = Path(cfg["era5_dir"])
@@ -78,7 +83,7 @@ def main():
     dust_da  = dust_da.sel(time=target_times)
     times    = route_da.time.values
 
-    targets = load_aeronet_targets(cfg["aeronet_path"])
+    targets = load_station_targets(primary_cfg, default_agg=cfg.get("target_agg", "median"))
 
     route_mean, route_std, dust_mean, dust_std = load_norm_stats(cfg["norm_stats_path"])
 
@@ -87,6 +92,7 @@ def main():
         cfg["t_in"], cfg["t_dust"],
         route_mean, route_std, dust_mean, dust_std,
         memmap_dir=cfg.get("memmap_dir"),
+        station_name=inference_station,
     )
 
     n_val   = max(1, int(len(full_dataset) * cfg["val_frac"]))
@@ -99,6 +105,7 @@ def main():
     # ── Build model and load weights ───────────────────────────────────────────
     model = PRAfricaDustRouteMeteoNet(
         route_channel_names=route_channel_names,
+        station_names=station_names,
         route_patch_size=tuple(cfg["route_patch_size"]),
         embed_dim=cfg["embed_dim"],
         num_heads_space=cfg["num_heads_space"],
@@ -142,7 +149,7 @@ def main():
             x_route = x_route.to(device)
             x_dust  = x_dust.to(device)
 
-            y_hat = model(x_dust, x_route, return_attn=False)
+            y_hat = model(x_dust, x_route, station=inference_station, return_attn=False)
             preds = y_hat.squeeze(-1).cpu().numpy()
             tgts  = y.numpy()
 

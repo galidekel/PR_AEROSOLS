@@ -208,9 +208,23 @@ class RouteMeteoEncoder(nn.Module):
 # Full model: Africa dust + route meteo
 # --------------------------------------------------
 class PRAfricaDustRouteMeteoNet(nn.Module):
+    """
+    Shared backbone (dust encoder + route encoder + fusion) with one
+    regression head PER AERONET STATION.
+
+    Predictors are large-scale regional fields (ERA5/CAMS), so a given
+    day's input is identical regardless of which PR station it's paired
+    with — a per-station head can only learn a fixed calibration offset
+    (e.g. correcting for a station's elevation), never real per-station
+    physics. Auxiliary stations exist purely to give the shared backbone
+    more gradient signal; only the primary station's head should ever be
+    used to produce a real prediction — the other heads are training-only
+    scaffolding and are ignored at inference.
+    """
     def __init__(
         self,
         route_channel_names: List[str],
+        station_names: List[str],
         route_patch_size=(1, 20, 20),
         embed_dim=256,
         num_heads_space=1,
@@ -224,6 +238,10 @@ class PRAfricaDustRouteMeteoNet(nn.Module):
         W_route: int = 480,
     ):
         super().__init__()
+
+        if not station_names:
+            raise ValueError("station_names must contain at least one station")
+        self.station_names = list(station_names)
 
         self.use_aeronet_at_t = use_aeronet_at_t
         self.aeronet_dim = aeronet_dim
@@ -255,21 +273,27 @@ class PRAfricaDustRouteMeteoNet(nn.Module):
 
         head_in = embed_dim + (aeronet_dim if use_aeronet_at_t else 0)
 
-        self.head = nn.Sequential(
-            nn.LayerNorm(head_in),
-            nn.Linear(head_in, head_in),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(head_in, out_dim),
-        )
+        def make_head():
+            return nn.Sequential(
+                nn.LayerNorm(head_in),
+                nn.Linear(head_in, head_in),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(head_in, out_dim),
+            )
+
+        self.heads = nn.ModuleDict({name: make_head() for name in self.station_names})
 
     def forward(
         self,
         X_dust,                      # [B, T, 2, H_d, W_d]
         X_route,                     # [B, T, C_r, H_r, W_r]
+        station: str,                 # which station's head to use — never mix stations in one call
         aeronet_t=None,              # optional [B, aeronet_dim]
         return_attn=True,
     ):
+        if station not in self.heads:
+            raise ValueError(f"Unknown station {station!r}; known heads: {list(self.heads.keys())}")
         B = X_dust.shape[0]
 
         # Dust source summary
@@ -298,7 +322,7 @@ class PRAfricaDustRouteMeteoNet(nn.Module):
                 )
             z0 = torch.cat([z0, aeronet_t.to(z0.dtype)], dim=1)
 
-        y_hat = self.head(z0)
+        y_hat = self.heads[station](z0)
 
         if return_attn:
             meta = {

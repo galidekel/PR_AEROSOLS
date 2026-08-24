@@ -1,10 +1,41 @@
 # ── Paths ────────────────────────────────────────────────────────────────────
 era5_dir:  "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/era5_dataset"
 cams_dir:  "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/cams_dataset"
-aeronet_path: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/20040101_20251231_Cape_San_Juan.tot_lev20"
 norm_stats_path: "norm_stats.json"
 memmap_dir: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/memmap"
 run_name: "run2"
+target_agg: "median"   # daily aggregation for tot_lev20-format stations: mean | median
+
+# ── AERONET stations ─────────────────────────────────────────────────────────
+# See config.yaml for the full explanation. Exactly one "primary" station
+# (used at inference); "auxiliary" stations only enrich the shared backbone.
+# NOTE: La_Parguera / NEON_GUAN files must be copied to this data_dir on the
+# HPC before this config can be used — they currently only exist locally.
+stations:
+  - name: "Cape_San_Juan"
+    role: "primary"
+    format: "tot_lev20"
+    path: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/20040101_20251231_Cape_San_Juan.tot_lev20"
+    target_col: "AOD_500nm-AOD"
+    lat: 18.3845
+    lon: -65.6199
+    elev: 15.0
+  - name: "La_Parguera"
+    role: "auxiliary"
+    format: "daily_lev20"
+    path: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/La_Parguera_all_years_lev20_daily.txt"
+    target_col: "AOD_500nm"
+    lat: 17.9705
+    lon: -67.0454
+    elev: 12.4
+  - name: "NEON_GUAN"
+    role: "auxiliary"
+    format: "daily_lev20"
+    path: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/NEON_GUAN_all_years_lev20_daily.txt"
+    target_col: "AOD_500nm"
+    lat: 17.9696
+    lon: -66.8687
+    elev: 128.0
 
 # File glob patterns for monthly NetCDF files
 pattern_era5_pl: "era5_pl_*.nc"
