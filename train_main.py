@@ -306,6 +306,7 @@ class PRLazyDataset(Dataset):
         route_mean=None, route_std=None,
         dust_mean=None,  dust_std=None,
         memmap_dir=None,
+        route_src=None, dust_src=None,   # pre-opened memmap/array to SHARE across datasets
         station_name="",
         max_target_date=None,   # exclusive upper bound (pd.Timestamp) — see leakage note below
     ):
@@ -317,8 +318,17 @@ class PRLazyDataset(Dataset):
         self.dust_mean  = dust_mean
         self.dust_std   = dust_std
 
-        # Use memmap if available, else fall back to xarray/dask
-        if memmap_dir is not None:
+        # route_src/dust_src let the caller share a single already-open
+        # memmap across multiple PRLazyDataset instances (e.g. primary +
+        # auxiliary stations all read the same route.dat/dust.dat). Opening
+        # a fresh np.memmap per station instead re-reserves the full file's
+        # virtual address space each time, which can exhaust the job's
+        # memory limit on large multi-year files — see [[hpc-memmap-vmem]].
+        if route_src is not None and dust_src is not None:
+            self.route_src  = route_src
+            self.dust_src   = dust_src
+            self.use_memmap = True
+        elif memmap_dir is not None:
             route_path = Path(memmap_dir) / "route.dat"
             dust_path  = Path(memmap_dir) / "dust.dat"
             meta_path  = Path(memmap_dir) / "meta.json"
@@ -622,10 +632,31 @@ def main():
     # ----------------------------------------------------------
     memmap_dir = cfg.get("memmap_dir", None)
 
+    # Open route.dat/dust.dat's memmap ONCE and share it across the primary
+    # + every auxiliary station's PRLazyDataset. Letting each instantiation
+    # open its own np.memmap re-reserves the whole file's virtual address
+    # space per call — with 1 primary + 2 auxiliary stations that's 3x the
+    # file size in VSZ, which can exceed the job's memory limit even though
+    # only one file is actually being read. See [[hpc-memmap-vmem]].
+    route_src = dust_src = None
+    if memmap_dir is not None:
+        route_path = Path(memmap_dir) / "route.dat"
+        dust_path  = Path(memmap_dir) / "dust.dat"
+        meta_path  = Path(memmap_dir) / "meta.json"
+        if route_path.exists() and dust_path.exists() and meta_path.exists():
+            import json
+            with open(meta_path) as f:
+                meta = json.load(f)
+            route_src = np.memmap(route_path, dtype="float32", mode="r", shape=tuple(meta["route_shape"]))
+            dust_src  = np.memmap(dust_path,  dtype="float32", mode="r", shape=tuple(meta["dust_shape"]))
+            print(f"[dataset] using shared memmap from {memmap_dir}")
+        else:
+            print(f"[dataset] memmap not found in {memmap_dir}, falling back to xarray")
+
     primary_full = PRLazyDataset(
         route_da, dust_da, station_targets[PRIMARY_NAME], times, T_IN, T_DUST,
         route_mean, route_std, dust_mean, dust_std,
-        memmap_dir=memmap_dir, station_name=PRIMARY_NAME,
+        route_src=route_src, dust_src=dust_src, station_name=PRIMARY_NAME,
     )
 
     n_val   = max(1, int(len(primary_full) * cfg["val_frac"]))
@@ -647,7 +678,7 @@ def main():
         aux_ds = PRLazyDataset(
             route_da, dust_da, station_targets[s["name"]], times, T_IN, T_DUST,
             route_mean, route_std, dust_mean, dust_std,
-            memmap_dir=memmap_dir, station_name=s["name"], max_target_date=cutoff_date,
+            route_src=route_src, dust_src=dust_src, station_name=s["name"], max_target_date=cutoff_date,
         )
         aux_loaders[s["name"]] = DataLoader(aux_ds, batch_size=cfg["batch_size"], shuffle=True,
                                             num_workers=0, pin_memory=device.type == "cuda")
