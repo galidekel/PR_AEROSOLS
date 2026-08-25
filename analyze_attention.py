@@ -158,8 +158,11 @@ def main():
     # Running sums for the Gate-1 (per-channel space-time) attention, so we
     # never hold [N, Tp, Hp, Wp] per channel in memory at once — only the
     # aggregated mean pattern, which is what's actually useful to plot.
-    spatial_sum  = {}   # ch -> [Hp, Wp] running sum (mean over T per sample, summed over samples)
-    temporal_sum = {}   # ch -> [Tp]    running sum (mean over H,W per sample, summed over samples)
+    spatial_sum  = {}   # ch -> [Hp, Wp]     running sum (mean over T per sample, summed over samples)
+    temporal_sum = {}   # ch -> [Tp]         running sum (mean over H,W per sample, summed over samples)
+    joint_sum    = {}   # ch -> [Tp, Hp, Wp] running sum, summed over samples (no marginalizing) --
+                         # this is what lets you ask "which patch, at which time" -- tiny (Tp*Hp*Wp
+                         # per channel, ~6k floats), no OOM risk even for all 48 channels at once.
     n_seen = 0
     Tp = Hp = Wp = None
 
@@ -186,6 +189,7 @@ def main():
                 for ch in route_channel_names:
                     spatial_sum[ch]  = np.zeros((Hp, Wp), dtype=np.float64)
                     temporal_sum[ch] = np.zeros((Tp,), dtype=np.float64)
+                    joint_sum[ch]    = np.zeros((Tp, Hp, Wp), dtype=np.float64)
                 log(f"Gate 1 grid: Tp={Tp} Hp={Hp} Wp={Wp}  |  Gate 2 tokens: {fusion_token_names}")
 
             # -- Gate 2: fusion weights, kept per-sample (small: N x (1+C_r)) --
@@ -205,6 +209,7 @@ def main():
                 a = a.squeeze(1).cpu().numpy()          # [B, Tp, Hp, Wp]
                 spatial_sum[ch]  += a.mean(axis=1).sum(axis=0)          # mean over T, sum over batch
                 temporal_sum[ch] += a.mean(axis=(2, 3)).sum(axis=0)     # mean over H,W, sum over batch
+                joint_sum[ch]    += a.sum(axis=0)                       # no marginalizing, sum over batch
 
             n_seen += bs
             log(f"batch {batch_idx + 1}/{limit}  ({n_seen} samples so far)")
@@ -234,6 +239,7 @@ def main():
     for ch in route_channel_names:
         save_dict[f"spatial__{ch}"]  = (spatial_sum[ch] / n_seen).astype(np.float32)
         save_dict[f"temporal__{ch}"] = (temporal_sum[ch] / n_seen).astype(np.float32)
+        save_dict[f"joint__{ch}"]    = (joint_sum[ch] / n_seen).astype(np.float32)   # [Tp,Hp,Wp] -- which patch, at which time
     np.savez(npz_path, **save_dict)
     log(f"saved {npz_path}  ({len(route_channel_names)} channels, averaged over {n_seen} samples)")
 
