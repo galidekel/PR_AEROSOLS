@@ -52,6 +52,10 @@ def main():
                         help="Number of val batches to run (0 = all)")
     parser.add_argument("--out_dir",    default="attention_out",
                         help="Directory to save fusion_weights.csv and route_attention.npz")
+    parser.add_argument("--high_q", type=float, default=0.90,
+                        help="Val samples with observed AOD >= this quantile form the HIGH-AOD group")
+    parser.add_argument("--low_q",  type=float, default=0.50,
+                        help="Val samples with observed AOD <= this quantile form the LOW-AOD group")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -152,6 +156,20 @@ def main():
         for k in range(len(val_ds))
     ]
 
+    # ── High / low observed-AOD groups (for conditional Gate-1 attention) ──
+    # The all-sample average smears dust events together with clean days. Splitting by the
+    # OBSERVED target lets us ask whether attention differs (e.g. follows a route) on high-AOD
+    # days. Thresholds come from the val targets only, so no extra data loading.
+    val_targets = np.array([full_dataset.samples[n_train + k][1] for k in range(len(val_ds))])
+    thr_hi = np.quantile(val_targets, args.high_q)
+    thr_lo = np.quantile(val_targets, args.low_q)
+    group = np.full(len(val_ds), -1, dtype=int)      # 1 = high AOD, 0 = low AOD, -1 = neither
+    group[val_targets <= thr_lo] = 0
+    group[val_targets >= thr_hi] = 1
+    n_hi, n_lo = int((group == 1).sum()), int((group == 0).sum())
+    log(f"AOD groups: high (>= {thr_hi:.3f}, q={args.high_q}) n={n_hi}  |  "
+        f"low (<= {thr_lo:.3f}, q={args.low_q}) n={n_lo}")
+
     fusion_token_names = None
     fusion_rows = []          # one row per sample: date, pred, target, <token weights...>
 
@@ -163,7 +181,10 @@ def main():
     joint_sum    = {}   # ch -> [Tp, Hp, Wp] running sum, summed over samples (no marginalizing) --
                          # this is what lets you ask "which patch, at which time" -- tiny (Tp*Hp*Wp
                          # per channel, ~6k floats), no OOM risk even for all 48 channels at once.
+    joint_hi = {}       # ch -> [Tp, Hp, Wp] running sum over HIGH-AOD samples
+    joint_lo = {}       # ch -> [Tp, Hp, Wp] running sum over LOW-AOD samples
     n_seen = 0
+    n_hi_seen = n_lo_seen = 0
     Tp = Hp = Wp = None
 
     limit = args.n_batches if args.n_batches > 0 else len(val_loader)
@@ -190,6 +211,8 @@ def main():
                     spatial_sum[ch]  = np.zeros((Hp, Wp), dtype=np.float64)
                     temporal_sum[ch] = np.zeros((Tp,), dtype=np.float64)
                     joint_sum[ch]    = np.zeros((Tp, Hp, Wp), dtype=np.float64)
+                    joint_hi[ch]     = np.zeros((Tp, Hp, Wp), dtype=np.float64)
+                    joint_lo[ch]     = np.zeros((Tp, Hp, Wp), dtype=np.float64)
                 log(f"Gate 1 grid: Tp={Tp} Hp={Hp} Wp={Wp}  |  Gate 2 tokens: {fusion_token_names}")
 
             # -- Gate 2: fusion weights, kept per-sample (small: N x (1+C_r)) --
@@ -205,8 +228,15 @@ def main():
                 fusion_rows.append(row)
 
             # -- Gate 1: per-channel space-time attention, accumulated as running mean --
+            g = group[start:start + bs]                 # AOD group of each sample in this batch
+            n_hi_seen += int((g == 1).sum())
+            n_lo_seen += int((g == 0).sum())
             for ch, a in attn_route.items():
                 a = a.squeeze(1).cpu().numpy()          # [B, Tp, Hp, Wp]
+                if (g == 1).any():
+                    joint_hi[ch] += a[g == 1].sum(axis=0)
+                if (g == 0).any():
+                    joint_lo[ch] += a[g == 0].sum(axis=0)
                 spatial_sum[ch]  += a.mean(axis=1).sum(axis=0)          # mean over T, sum over batch
                 temporal_sum[ch] += a.mean(axis=(2, 3)).sum(axis=0)     # mean over H,W, sum over batch
                 joint_sum[ch]    += a.sum(axis=0)                       # no marginalizing, sum over batch
@@ -235,13 +265,20 @@ def main():
         "area_route": np.array(cfg["area_route"]),
         "t_step_hours": cfg["t_step_hours"],
         "t_in_days": cfg["t_in_days"],
+        "n_high": n_hi_seen, "n_low": n_lo_seen,
+        "thr_high": thr_hi, "thr_low": thr_lo,
+        "high_q": args.high_q, "low_q": args.low_q,
     }
     for ch in route_channel_names:
+        # mean attention over the high-/low-AOD samples (each sums to 1 over t,h,w per sample)
+        save_dict[f"joint_high__{ch}"] = (joint_hi[ch] / max(n_hi_seen, 1)).astype(np.float32)
+        save_dict[f"joint_low__{ch}"]  = (joint_lo[ch] / max(n_lo_seen, 1)).astype(np.float32)
         save_dict[f"spatial__{ch}"]  = (spatial_sum[ch] / n_seen).astype(np.float32)
         save_dict[f"temporal__{ch}"] = (temporal_sum[ch] / n_seen).astype(np.float32)
         save_dict[f"joint__{ch}"]    = (joint_sum[ch] / n_seen).astype(np.float32)   # [Tp,Hp,Wp] -- which patch, at which time
     np.savez(npz_path, **save_dict)
-    log(f"saved {npz_path}  ({len(route_channel_names)} channels, averaged over {n_seen} samples)")
+    log(f"saved {npz_path}  ({len(route_channel_names)} channels, averaged over {n_seen} samples; "
+        f"high-AOD n={n_hi_seen}, low-AOD n={n_lo_seen})")
 
     log("done")
 
