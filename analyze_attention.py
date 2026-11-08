@@ -20,7 +20,7 @@ with plot_attention.py.
 Usage:
     python analyze_attention.py --checkpoint outputs/run_3_stations_/best.pt \
         --config config_hpc.yaml --out_dir outputs/run_3_stations_/attention
-    python analyze_attention.py --checkpoint ... --config ... --n_batches 20   # quick test
+    python analyze_attention.py --checkpoint ... --config ... --n_batches 20   # quick test yada
 """
 
 import argparse
