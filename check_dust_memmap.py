@@ -1,5 +1,5 @@
 """
-Check the dust input the model trains on (memmap dust.dat) for missing / empty cells, and compare it
+Check the dust input the model trains on (memmap dust.dat) for missing or empty cells, and compare it
 with the raw CAMS files at the same time steps.
 
 Why: the memmap regional mean is raw mean / 1.984 (constant) while the max is identical -> maybe ~half of
