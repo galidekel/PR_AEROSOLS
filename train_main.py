@@ -115,6 +115,15 @@ def load_all_files(data_dir, pattern, chunks=None):
     for f in files:
         print(f"         {f.name}")
     datasets = [open_nc_or_zipped_nc(f, chunks=chunks) for f in files]
+    # Guard: concat does an OUTER join on lat/lon, so one file on a different grid silently doubles the
+    # grid with NaN rows (this happened with cams_eac4_aod550_test.nc). Refuse instead.
+    ref = datasets[0]
+    for f, d in zip(files[1:], datasets[1:]):
+        for c in ("latitude", "longitude", "lat", "lon"):
+            if c in ref.coords and (c not in d.coords or d[c].shape != ref[c].shape
+                                    or not np.allclose(d[c].values, ref[c].values)):
+                raise ValueError(f"[loader] {f.name} has a different '{c}' grid than {files[0].name}; "
+                                 f"move it out of {data_dir} or tighten the file pattern.")
     ds = xr.concat(datasets, dim="time").sortby("time")
     _, unique_idx = np.unique(ds.time.values, return_index=True)
     ds = ds.isel(time=unique_idx)

@@ -40,7 +40,7 @@ stations:
 # File glob patterns for monthly NetCDF files
 pattern_era5_pl: "era5_pl_*.nc"
 pattern_era5_sl: "era5_sl_*.nc"
-pattern_cams:    "cams_eac4_*.nc"
+pattern_cams:    "cams_eac4_total_dust_aod550_3h_*.nc"
 
 # ── Spatial domains  [north, west, south, east] ───────────────────────────────
 area_route:  [35, -90, -10,  30]   # Africa → Atlantic → Caribbean (ERA5)
