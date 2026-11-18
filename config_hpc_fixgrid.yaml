@@ -1,7 +1,7 @@
 # ── Paths ────────────────────────────────────────────────────────────────────
 era5_dir:  "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/era5_dataset"
 cams_dir:  "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/cams_dataset"
-norm_stats_path: "norm_stats.json"
+norm_stats_path: "norm_stats_fixgrid.json"
 memmap_dir: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/memmap_fixgrid"
 run_name: "run_3_stations_fixgrid"
 target_agg: "median"   # daily aggregation for tot_lev20-format stations: mean | median
