@@ -11,7 +11,7 @@ target_agg: "median"   # daily aggregation for tot_lev20-format stations: mean |
 # See config.yaml for the full explanation. Exactly one "primary" station!
 # (used at inference); "auxiliary" stations only enrich the shared backbone.
 # NOTE: La_Parguera / NEON_GUAN files must be copied to this data_dir on the
-# HPC before this config can be used — they currently only exist locally!
+# HPC before this config can be used — they currently only exist locally!!
 stations:
   - name: "Cape_San_Juan"
     role: "primary"

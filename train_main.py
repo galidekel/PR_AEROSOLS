@@ -18,7 +18,7 @@ from pr_VIT_dustmeteo import PRAfricaDustRouteMeteoNet
 
 # =========================================================
 # 1) CONFIG LOADER
-# =========================================================/
+# =========================================================//
 def load_config(path="config.yaml"):
     with open(path) as f:
         cfg = yaml.safe_load(f)
