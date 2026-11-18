@@ -254,7 +254,7 @@ def load_station_targets(station_cfg, default_agg="median"):
 # =========================================================
 # 7) NORMALIZATION STATS  (compute once, cache to JSON)
 # =========================================================
-def compute_norm_stats(route_da, dust_da, n_samples=200, seed=42):
+def compute_norm_stats(route_da, dust_da, n_samples=200, seed=42, dust_only=False):
     """
     Estimates per-channel mean and std from n_samples random single timesteps.
     Peak RAM = one timestep at a time — never loads the full series.
@@ -265,14 +265,17 @@ def compute_norm_stats(route_da, dust_da, n_samples=200, seed=42):
 
     r_means, r_stds, d_means, d_stds = [], [], [], []
     for i in tqdm(idxs, desc="norm stats", unit="step"):
-        xr_ = route_da.isel(time=int(i)).values.astype(np.float32)  # [C_r, H, W]
         xd_ = dust_da.isel(time=int(i)).values.astype(np.float32)   # [C_d, H, W]
-        r_means.append(xr_.mean(axis=(1, 2)))
-        r_stds.append(xr_.std(axis=(1, 2)))
+        if not dust_only:
+            xr_ = route_da.isel(time=int(i)).values.astype(np.float32)  # [C_r, H, W]
+            r_means.append(xr_.mean(axis=(1, 2)))
+            r_stds.append(xr_.std(axis=(1, 2)))
         d_means.append(xd_.mean(axis=(1, 2)))
         d_stds.append(xd_.std(axis=(1, 2)))
 
     def to_t(lst):
+        if not lst:
+            return None
         return torch.from_numpy(np.stack(lst).mean(axis=0).astype(np.float32)).view(1, -1, 1, 1)
 
     return to_t(r_means), to_t(r_stds), to_t(d_means), to_t(d_stds)
@@ -625,6 +628,15 @@ def main():
     if NORM_STATS_PATH.exists():
         route_mean, route_std, dust_mean, dust_std = load_norm_stats(NORM_STATS_PATH)
         print(f"[norm] loaded from {NORM_STATS_PATH}")
+    elif cfg.get("norm_stats_route_from") and Path(cfg["norm_stats_route_from"]).exists():
+        # Route (ERA5) data is unchanged -> reuse its mean/std from an earlier stats file (reading 200 steps of
+        # 48 channels from the NetCDFs is the slow part) and recompute ONLY the small dust stats.
+        route_mean, route_std, _, _ = load_norm_stats(Path(cfg["norm_stats_route_from"]))
+        print(f"[norm] route stats reused from {cfg['norm_stats_route_from']}; recomputing dust stats only")
+        _, _, dust_mean, dust_std = compute_norm_stats(
+            route_da, dust_da, n_samples=cfg["norm_n_samples"], dust_only=True
+        )
+        save_norm_stats(NORM_STATS_PATH, route_mean, route_std, dust_mean, dust_std)
     else:
         route_mean, route_std, dust_mean, dust_std = compute_norm_stats(
             route_da, dust_da, n_samples=cfg["norm_n_samples"]
