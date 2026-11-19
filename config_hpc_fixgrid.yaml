@@ -65,7 +65,7 @@ dropout:          0.1
 out_dim:          1             # regression: scalar AOD_500nm
 
 # ── Training ──────────────────────────────────────────────────────────────────
-batch_size:   4
+batch_size:   16
 num_epochs:   50
 lr:           1.0e-4
 weight_decay: 1.0e-4
