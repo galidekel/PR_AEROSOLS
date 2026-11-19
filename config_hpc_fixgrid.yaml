@@ -4,7 +4,7 @@ cams_dir:  "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/cams_dataset
 norm_stats_path: "norm_stats_fixgrid.json"
 norm_stats_route_from: "norm_stats.json"   # route (ERA5) unchanged: reuse its mean/std, recompute only the dust stats
 memmap_dir: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/memmap_fixgrid"
-run_name: "run_3_stations_fixgrid"
+run_name: "run_3_stations_fixgrid_bs16"
 target_agg: "median"   # daily aggregation for tot_lev20-format stations: mean | median
 
 # ── AERONET stations ─────────────────────────────────────────────────────────
