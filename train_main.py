@@ -87,13 +87,22 @@ def open_nc_or_zipped_nc(path, engine="netcdf4", chunks=None):
 
     extract_dir = str(path) + "_unzipped"
     os.makedirs(extract_dir, exist_ok=True)
+    # Several jobs (e.g. cross-validation folds started together) share these extracted files. Never rewrite a file
+    # in place: extract only when it is missing or its size differs from the zip entry (truncated by an earlier
+    # crash/race), and do it via a private temp file + atomic rename so a reader never sees a half-written .nc.
+    import shutil
+    nc_paths = []
     with zipfile.ZipFile(path, "r") as zf:
-        zf.extractall(extract_dir)
-        nc_paths = [
-            os.path.join(extract_dir, name)
-            for name in zf.namelist()
-            if name.endswith(".nc")
-        ]
+        for info in zf.infolist():
+            if not info.filename.endswith(".nc"):
+                continue
+            dest = os.path.join(extract_dir, info.filename)
+            if not (os.path.exists(dest) and os.path.getsize(dest) == info.file_size):
+                tmp = f"{dest}.tmp{os.getpid()}"
+                with zf.open(info) as src, open(tmp, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                os.replace(tmp, dest)
+            nc_paths.append(dest)
     dss = []
     for p in nc_paths:
         ds = xr.open_dataset(p, engine=engine, chunks=chunks)
