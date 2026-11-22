@@ -4,7 +4,7 @@ cams_dir:  "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/cams_dataset
 norm_stats_path: "norm_stats_fixgrid.json"
 norm_stats_route_from: "norm_stats.json"   # route (ERA5) unchanged: reuse its mean/std, recompute only the dust stats
 memmap_dir: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/memmap_fixgrid"
-run_name: "run_3_stations_bs16_d64_do03_wd1e3"
+run_name: "run_3_stations_bs16"
 target_agg: "median"   # daily aggregation for tot_lev20-format stations: mean | median
 
 # ── AERONET stations ─────────────────────────────────────────────────────────
@@ -58,15 +58,15 @@ norm_n_samples:   200   # timesteps sampled to estimate norm stats
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 route_patch_size: [1, 20, 20]   # (temporal, lat, lon) patch size for PatchEmbed3D
-embed_dim:        64
+embed_dim:        256
 num_heads_space:  4
 num_heads_fusion: 4
-dropout:          0.3
+dropout:          0.1
 out_dim:          1             # regression: scalar AOD_500nm
 
 # ── Training ──────────────────────────────────────────────────────────────────
 batch_size:   16
 num_epochs:   50
 lr:           1.0e-4
-weight_decay: 1.0e-3
+weight_decay: 1.0e-4
 val_frac:     0.15   # fraction of samples (by time) held out for validation
