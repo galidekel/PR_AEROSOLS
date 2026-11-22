@@ -304,6 +304,65 @@ def load_norm_stats(path):
 # =========================================================
 # 8) LAZY PYTORCH DATASET
 # =========================================================
+def apply_split_override(cfg, n_folds=None, val_fold=None, ckpt_path=None):
+    """Which train/val split to use. Priority: CLI args > split.json next to the checkpoint > config."""
+    import json
+    if n_folds is None and val_fold is None and ckpt_path is not None:
+        p = Path(ckpt_path).parent / "split.json"
+        if p.exists():
+            d = json.loads(p.read_text())
+            n_folds, val_fold = d.get("n_folds"), d.get("val_fold")
+            if d.get("val_windows"):
+                cfg["val_windows"] = d["val_windows"]
+            if val_fold is None and d.get("val_fold") is not None:
+                val_fold = d["val_fold"]
+            cfg["embargo_days"] = d.get("embargo_days", cfg.get("embargo_days", 7))
+            print(f"[split] using {p}: n_folds={n_folds} val_fold={val_fold}")
+    if n_folds is not None:
+        cfg["n_folds"] = n_folds
+    if val_fold is not None:
+        cfg["val_fold"] = val_fold
+    return cfg
+
+
+def make_split(sample_dates, cfg):
+    """
+    Split the PRIMARY station's samples (sorted by date) into train / val index lists.
+
+      default (no n_folds / val_fold): chronological — last `val_frac` is val   (the original split)
+      n_folds=K, val_fold=f (0..K-1):  val = f-th contiguous 1/K block of the timeline; train = everything else
+                                       EXCEPT `embargo_days` (default 7 = the input window) on each side of
+                                       the val block, so no training window overlaps / abuts the val days.
+
+    Returns (train_idx, val_idx, info). info["cutoff"] (tail mode) or info["exclude"] = (lo, hi) (fold mode)
+    is what the auxiliary stations must avoid, since they share the same input fields.
+    """
+    n = len(sample_dates)
+    k, f = cfg.get("n_folds"), cfg.get("val_fold")
+    wins = cfg.get("val_windows")
+    if wins and f is not None:        # explicit CALENDAR windows: val_windows: [[start, end], ...], pick by val_fold
+        if not 0 <= f < len(wins):
+            raise ValueError(f"val_fold={f} must be in [0, {len(wins) - 1}] for {len(wins)} val_windows")
+        w0, w1 = pd.Timestamp(wins[f][0]), pd.Timestamp(wins[f][1])
+        emb = pd.Timedelta(days=cfg.get("embargo_days", 7))
+        val_idx = [i for i, d in enumerate(sample_dates) if w0 <= d <= w1]
+        train_idx = [i for i, d in enumerate(sample_dates) if d < w0 - emb or d > w1 + emb]
+        return train_idx, val_idx, {"mode": "fold", "exclude": (w0 - emb, w1 + emb),
+                                    "val_range": (sample_dates[val_idx[0]], sample_dates[val_idx[-1]])}
+    if not k or f is None:
+        n_val = max(1, int(n * cfg["val_frac"]))
+        n_tr = n - n_val
+        return list(range(n_tr)), list(range(n_tr, n)), {"mode": "tail", "cutoff": sample_dates[n_tr]}
+    if not 0 <= f < k:
+        raise ValueError(f"val_fold={f} must be in [0, {k - 1}] for n_folds={k}")
+    lo, hi = f * n // k, (f + 1) * n // k
+    val_idx = list(range(lo, hi))
+    emb = pd.Timedelta(days=cfg.get("embargo_days", 7))
+    v0, v1 = sample_dates[lo], sample_dates[hi - 1]
+    train_idx = [i for i, d in enumerate(sample_dates) if d < v0 - emb or d > v1 + emb]
+    return train_idx, val_idx, {"mode": "fold", "exclude": (v0 - emb, v1 + emb), "val_range": (v0, v1)}
+
+
 class PRLazyDataset(Dataset):
     """
     If memmap files exist on scratch, uses np.memmap for O(1) index access.
@@ -321,6 +380,7 @@ class PRLazyDataset(Dataset):
         route_src=None, dust_src=None,   # pre-opened memmap/array to SHARE across datasets
         station_name="",
         max_target_date=None,   # exclusive upper bound (pd.Timestamp) — see leakage note below
+        exclude_range=None,     # (lo, hi) pd.Timestamps: drop target dates lo <= d <= hi (cross-validation folds)
     ):
         self.station_name = station_name
         self.T_in       = T_in
@@ -386,6 +446,9 @@ class PRLazyDataset(Dataset):
             # station's dataset (see main()); the primary's own dataset
             # passes None here and is split by index afterwards instead.
             if max_target_date is not None and t_target >= max_target_date:
+                n_skipped_leakage += 1
+                continue
+            if exclude_range is not None and exclude_range[0] <= t_target <= exclude_range[1]:
                 n_skipped_leakage += 1
                 continue
             self.samples.append((i, float(targets.loc[t_target])))
@@ -530,9 +593,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config",   default="config.yaml", help="Path to YAML config file")
     parser.add_argument("--run_name", default=None,          help="Run name (overrides config)")
+    parser.add_argument("--n_folds",  type=int, default=None, help="Cross-validation: number of contiguous time blocks")
+    parser.add_argument("--val_fold", type=int, default=None, help="Cross-validation: which block (0-based) is the val set")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    apply_split_override(cfg, args.n_folds, args.val_fold)
     if args.run_name:
         cfg["run_name"]       = args.run_name
         cfg["checkpoint_dir"] = f"outputs/{args.run_name}"
@@ -680,12 +746,22 @@ def main():
         route_src=route_src, dust_src=dust_src, station_name=PRIMARY_NAME,
     )
 
-    n_val   = max(1, int(len(primary_full) * cfg["val_frac"]))
-    n_train = len(primary_full) - n_val
-    train_ds = Subset(primary_full, range(n_train))
-    val_ds   = Subset(primary_full, range(n_train, len(primary_full)))
-    cutoff_date = primary_full.sample_dates[n_train]   # first val date — aux training stays strictly before this
-    print(f"[split] primary train={len(train_ds)}  val={len(val_ds)}  cutoff={cutoff_date.date()}")
+    train_idx, val_idx, split_info = make_split(primary_full.sample_dates, cfg)
+    train_ds = Subset(primary_full, train_idx)
+    val_ds   = Subset(primary_full, val_idx)
+    if split_info["mode"] == "tail":
+        aux_split_kwargs = {"max_target_date": split_info["cutoff"]}   # aux training stays strictly before the first val date
+        print(f"[split] primary train={len(train_ds)}  val={len(val_ds)}  cutoff={split_info['cutoff'].date()}")
+    else:
+        aux_split_kwargs = {"exclude_range": split_info["exclude"]}    # aux must also avoid the val block (+ embargo)
+        v0, v1 = split_info["val_range"]
+        print(f"[split] fold {cfg['val_fold']}/{cfg.get('n_folds') or len(cfg.get('val_windows') or [])}: primary train={len(train_ds)}  val={len(val_ds)}  "
+              f"val {v0.date()} → {v1.date()}  (embargo ±{cfg.get('embargo_days', 7)} d around it)")
+    import json as _json
+    (CHECKPOINT_DIR / "split.json").write_text(_json.dumps({
+        "n_folds": cfg.get("n_folds"), "val_fold": cfg.get("val_fold"),
+        "embargo_days": cfg.get("embargo_days", 7), "val_frac": cfg["val_frac"],
+        "val_windows": cfg.get("val_windows")}))
 
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True,
                               num_workers=0, pin_memory=device.type == "cuda")
@@ -699,7 +775,7 @@ def main():
         aux_ds = PRLazyDataset(
             route_da, dust_da, station_targets[s["name"]], times, T_IN, T_DUST,
             route_mean, route_std, dust_mean, dust_std,
-            route_src=route_src, dust_src=dust_src, station_name=s["name"], max_target_date=cutoff_date,
+            route_src=route_src, dust_src=dust_src, station_name=s["name"], **aux_split_kwargs,
         )
         aux_loaders[s["name"]] = DataLoader(aux_ds, batch_size=cfg["batch_size"], shuffle=True,
                                             num_workers=0, pin_memory=device.type == "cuda")

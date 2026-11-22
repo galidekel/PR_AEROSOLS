@@ -36,7 +36,7 @@ from pr_VIT_dustmeteo import PRAfricaDustRouteMeteoNet
 from train_main import (
     load_config, load_all_files, load_norm_stats,
     crop_area, build_route_dataset, build_dust_dataset,
-    load_station_targets, PRLazyDataset,
+    load_station_targets, PRLazyDataset, make_split, apply_split_override,
 )
 
 
@@ -56,12 +56,15 @@ def main():
                         help="Val samples with observed AOD >= this quantile form the HIGH-AOD group")
     parser.add_argument("--low_q",  type=float, default=0.50,
                         help="Val samples with observed AOD <= this quantile form the LOW-AOD group")
+    parser.add_argument("--n_folds",  type=int, default=None, help="Split: number of time blocks (default: split.json next to the checkpoint, else config)")
+    parser.add_argument("--val_fold", type=int, default=None, help="Split: which block is the val set")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = load_config(args.config)
+    apply_split_override(cfg, args.n_folds, args.val_fold, args.checkpoint)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log(f"device={device}")
 
@@ -119,10 +122,10 @@ def main():
         station_name=inference_station,
     )
 
-    n_val   = max(1, int(len(full_dataset) * cfg["val_frac"]))
-    n_train = len(full_dataset) - n_val
-    val_ds  = Subset(full_dataset, range(n_train, len(full_dataset)))
-    log(f"split: total={len(full_dataset)}  train={n_train}  val={len(val_ds)}")
+    train_idx, val_idx, _ = make_split(full_dataset.sample_dates, cfg)
+    val_ds  = Subset(full_dataset, val_idx)
+    log(f"split: total={len(full_dataset)}  train={len(train_idx)}  val={len(val_ds)}  "
+        f"(n_folds={cfg.get('n_folds')} val_fold={cfg.get('val_fold')})")
 
     val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"], shuffle=False, num_workers=0)
 
@@ -152,7 +155,7 @@ def main():
     # ── Collect dates for each val sample (mirrors infer.py) ──────────────
     T_IN = cfg["t_in"]
     val_dates = [
-        pd.Timestamp(times[full_dataset.samples[n_train + k][0] + T_IN - 1]).normalize()
+        pd.Timestamp(times[full_dataset.samples[val_idx[k]][0] + T_IN - 1]).normalize()
         for k in range(len(val_ds))
     ]
 
@@ -160,7 +163,7 @@ def main():
     # The all-sample average smears dust events together with clean days. Splitting by the
     # OBSERVED target lets us ask whether attention differs (e.g. follows a route) on high-AOD
     # days. Thresholds come from the val targets only, so no extra data loading.
-    val_targets = np.array([full_dataset.samples[n_train + k][1] for k in range(len(val_ds))])
+    val_targets = np.array([full_dataset.samples[val_idx[k]][1] for k in range(len(val_ds))])
     thr_hi = np.quantile(val_targets, args.high_q)
     thr_lo = np.quantile(val_targets, args.low_q)
     group = np.full(len(val_ds), -1, dtype=int)      # 1 = high AOD, 0 = low AOD, -1 = neither

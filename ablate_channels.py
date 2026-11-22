@@ -40,7 +40,7 @@ from pr_VIT_dustmeteo import PRAfricaDustRouteMeteoNet
 from train_main import (
     load_config, load_all_files, load_norm_stats,
     crop_area, build_route_dataset, build_dust_dataset,
-    load_station_targets, PRLazyDataset,
+    load_station_targets, PRLazyDataset, make_split, apply_split_override,
 )
 
 DEFAULT_SPECS = ["pv_700", "pv_900", "pv_850", "pv_*", "t_700", "t_850", "t_500", "z_500", "dust"]
@@ -60,11 +60,14 @@ def main():
     parser.add_argument("--n_repeats", type=int, default=3, help="Shuffle pairings to average (shuffle mode)")
     parser.add_argument("--n_boot", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--n_folds",  type=int, default=None, help="Split: number of time blocks (default: split.json next to the checkpoint, else config)")
+    parser.add_argument("--val_fold", type=int, default=None, help="Split: which block is the val set")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cfg = load_config(args.config)
+    apply_split_override(cfg, args.n_folds, args.val_fold, args.checkpoint)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log(f"device={device}")
 
@@ -97,10 +100,10 @@ def main():
     full = PRLazyDataset(route_da, dust_da, targets, times, cfg["t_in"], cfg["t_dust"],
                          route_mean, route_std, dust_mean, dust_std,
                          memmap_dir=cfg.get("memmap_dir"), station_name=inference_station)
-    n_val = max(1, int(len(full) * cfg["val_frac"]))
-    n_train = len(full) - n_val
-    val_ds = Subset(full, range(n_train, len(full)))
-    log(f"split: total={len(full)} train={n_train} val={n_val}")
+    train_idx, val_idx, _ = make_split(full.sample_dates, cfg)
+    n_val, n_train = len(val_idx), len(train_idx)
+    val_ds = Subset(full, val_idx)
+    log(f"split: total={len(full)} train={n_train} val={n_val}  (n_folds={cfg.get('n_folds')} val_fold={cfg.get('val_fold')})")
 
     model = PRAfricaDustRouteMeteoNet(
         route_channel_names=route_channel_names, station_names=station_names,
@@ -134,7 +137,7 @@ def main():
     perms = [rng.permutation(n_val) for _ in range(n_rep)]
 
     B = cfg["batch_size"]
-    y_all = np.array([full.samples[n_train + i][1] for i in range(n_val)])   # targets only; no data loading
+    y_all = np.array([full.samples[val_idx[i]][1] for i in range(n_val)])   # targets only; no data loading
     se_base = np.zeros(n_val)
     se_abl = {k: np.zeros((n_rep, n_val)) for k in specs}
 
@@ -166,7 +169,7 @@ def main():
         log(f"batch {start // B + 1}/{int(np.ceil(n_val / B))}")
 
     # ── Statistics ──────────────────────────────────────────────────────────
-    train_mean = float(np.mean([full.samples[i][1] for i in range(n_train)]))
+    train_mean = float(np.mean([full.samples[i][1] for i in train_idx]))
     mse_clim = float(np.mean((y_all - train_mean) ** 2))
     mse_base = float(se_base.mean())
     log(f"val MSE intact={mse_base:.6f}   climatology (train-mean AOD)={mse_clim:.6f}   "
