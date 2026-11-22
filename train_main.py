@@ -99,6 +99,12 @@ def open_nc_or_zipped_nc(path, engine="netcdf4", chunks=None):
         ds = xr.open_dataset(p, engine=engine, chunks=chunks)
         if "valid_time" in ds.coords and "time" not in ds.coords:
             ds = ds.rename({"valid_time": "time"})
+        if "time" in ds.coords and not ds.indexes["time"].is_unique:
+            # a stream inside the zip repeats time stamps (e.g. overlapping/ERA5T data) -> xr.merge cannot align
+            print(f"[loader] {Path(path).name}: {os.path.basename(p)} has {int(ds.time.size - ds.indexes['time'].nunique())} "
+                  f"duplicate time stamps; keeping the first of each")
+            _, keep = np.unique(ds.time.values, return_index=True)
+            ds = ds.isel(time=np.sort(keep))
         dss.append(ds)
     ds_merged = xr.merge(dss, compat="override", join="inner")
     return ds_merged.sortby("time") if "time" in ds_merged.coords else ds_merged
@@ -114,7 +120,12 @@ def load_all_files(data_dir, pattern, chunks=None):
     print(f"[loader] {len(files)} file(s) for '{pattern}':")
     for f in files:
         print(f"         {f.name}")
-    datasets = [open_nc_or_zipped_nc(f, chunks=chunks) for f in files]
+    datasets = []
+    for f in files:
+        try:
+            datasets.append(open_nc_or_zipped_nc(f, chunks=chunks))
+        except Exception as e:
+            raise RuntimeError(f"[loader] failed to open {f}: {e}") from e
     # Guard: concat does an OUTER join on lat/lon, so one file on a different grid silently doubles the
     # grid with NaN rows (this happened with cams_eac4_aod550_test.nc). Refuse instead.
     ref = datasets[0]
