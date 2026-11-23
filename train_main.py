@@ -383,6 +383,95 @@ def make_split(sample_dates, cfg):
     return train_idx, val_idx, {"mode": "fold", "exclude": (v0 - emb, v1 + emb), "val_range": (v0, v1)}
 
 
+class TargetTransform:
+    """
+    What the model is trained to predict, relative to the raw daily AOD (all options default to "raw AOD"):
+      kind    "none" | "log" | "sqrt"   transform applied to the AOD first (log/sqrt compress the long dust tail)
+      anomaly True  -> subtract the seasonal climatology (smoothed day-of-year mean of the TRANSFORMED target,
+                       fitted on training days only), i.e. the model predicts "how far from a normal <day> is today"
+                False -> (kind != none) subtract the training mean only, to centre the target
+    forward(dates, raw) -> training target;  inverse(dates, y) -> AOD again (so metrics are always in AOD units).
+    """
+
+    def __init__(self, kind="none", anomaly=False, mu=0.0, clim=None):
+        self.kind, self.anomaly, self.mu = kind, bool(anomaly), float(mu)
+        self.clim = None if clim is None else np.asarray(clim, dtype=float)
+
+    @property
+    def identity(self):
+        return self.kind == "none" and not self.anomaly
+
+    @staticmethod
+    def _t(x, kind):
+        x = np.asarray(x, dtype=float)
+        return np.log(x) if kind == "log" else np.sqrt(x) if kind == "sqrt" else x
+
+    @staticmethod
+    def _inv(z, kind):
+        z = np.asarray(z, dtype=float)
+        return np.exp(z) if kind == "log" else np.square(np.maximum(z, 0.0)) if kind == "sqrt" else z
+
+    @classmethod
+    def fit(cls, kind, anomaly, dates, raw, smooth=21):
+        z = cls._t(raw, kind)
+        if anomaly:
+            ser = pd.Series(z, index=pd.DatetimeIndex(dates))
+            clim = ser.groupby(ser.index.dayofyear).mean().reindex(range(1, 367)).interpolate(limit_direction="both").values
+            pad = smooth                                   # circular smoothing: Dec 31 and Jan 1 are neighbours
+            padded = np.concatenate([clim[-pad:], clim, clim[:pad]])
+            clim = pd.Series(padded).rolling(smooth, center=True, min_periods=1).mean().values[pad:-pad]
+            return cls(kind, True, 0.0, clim)
+        return cls(kind, False, float(np.mean(z)) if kind != "none" else 0.0, None)
+
+    def offset(self, dates):
+        if self.anomaly:
+            return self.clim[pd.DatetimeIndex(dates).dayofyear.values - 1]
+        return self.mu
+
+    def forward(self, dates, raw):
+        return self._t(raw, self.kind) - self.offset(dates)
+
+    def inverse(self, dates, y):
+        return self._inv(np.asarray(y, dtype=float) + self.offset(dates), self.kind)
+
+    def to_dict(self):
+        return {"kind": self.kind, "anomaly": self.anomaly, "mu": self.mu,
+                "clim": None if self.clim is None else self.clim.tolist()}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(d["kind"], d["anomaly"], d.get("mu", 0.0), d.get("clim")) if d else cls()
+
+
+@torch.no_grad()
+def predict_aod(model, loader, device, station, dates, tf):
+    """Run the model over a (non-shuffled) loader and return predictions in AOD units."""
+    model.eval()
+    preds = []
+    for batch in loader:
+        x_route, x_dust = batch[0].to(device), batch[1].to(device)
+        preds.append(model(x_dust, x_route, station=station, return_attn=False).squeeze(-1).cpu().numpy())
+    return tf.inverse(dates, np.concatenate(preds))
+
+
+def aod_metrics(pred, obs, dates, clim_raw, thr):
+    """Val metrics in AOD units: error, skill, skill on the anomaly (vs the seasonal climatology), dust-EVENT scores."""
+    obs, pred = np.asarray(obs, float), np.asarray(pred, float)
+    mse = float(np.mean((pred - obs) ** 2)); var = float(np.var(obs))
+    out = {"rmse": mse ** 0.5, "r2": 1 - mse / (var + 1e-12), "r": float(np.corrcoef(pred, obs)[0, 1])}
+    if clim_raw is not None:
+        cl = clim_raw[pd.DatetimeIndex(dates).dayofyear.values - 1]
+        out["r2_anom"] = 1 - float(np.mean((pred - obs) ** 2)) / (float(np.mean((obs - cl) ** 2)) + 1e-12)
+        out["r_anom"] = float(np.corrcoef(pred - cl, obs - cl)[0, 1])
+    ev, pe = obs > thr, pred > thr                       # dust EVENTS = observed AOD above the threshold
+    tp, fn, fp = int((ev & pe).sum()), int((ev & ~pe).sum()), int((~ev & pe).sum())
+    out.update(n_event=int(ev.sum()), pod=tp / max(tp + fn, 1), far=fp / max(tp + fp, 1),
+               f1=2 * tp / max(2 * tp + fp + fn, 1),
+               mse_hi=float(np.mean((pred[ev] - obs[ev]) ** 2)) if ev.any() else float("nan"),
+               bias_hi=float(np.mean(pred[ev] - obs[ev])) if ev.any() else float("nan"))
+    return out
+
+
 class PRLazyDataset(Dataset):
     """
     If memmap files exist on scratch, uses np.memmap for O(1) index access.
@@ -401,8 +490,12 @@ class PRLazyDataset(Dataset):
         station_name="",
         max_target_date=None,   # exclusive upper bound (pd.Timestamp) — see leakage note below
         exclude_range=None,     # (lo, hi) pd.Timestamps: drop target dates lo <= d <= hi (cross-validation folds)
+        target_tf=None,         # TargetTransform (set later via set_target_tf, after the split is known)
+        weight_cfg=None,        # (threshold, extra_weight): training samples with raw AOD > threshold count 1 + extra_weight
     ):
         self.station_name = station_name
+        self.target_tf  = target_tf
+        self.weight_cfg = weight_cfg
         self.T_in       = T_in
         self.T_dust     = T_dust
         self.route_mean = route_mean
@@ -481,8 +574,14 @@ class PRLazyDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def set_target_tf(self, tf, weight_cfg=None):
+        self.target_tf, self.weight_cfg = tf, weight_cfg
+
     def __getitem__(self, idx):
-        i, y = self.samples[idx]
+        i, y_raw = self.samples[idx]
+        y = y_raw
+        if self.target_tf is not None and not self.target_tf.identity:
+            y = float(self.target_tf.forward([self.sample_dates[idx]], [y_raw])[0])
 
         if self.use_memmap:
             x_route = torch.from_numpy(
@@ -507,20 +606,28 @@ class PRLazyDataset(Dataset):
         if self.dust_mean is not None:
             x_dust = (x_dust - self.dust_mean) / (self.dust_std + 1e-6)
 
-        return x_route, x_dust, torch.tensor(y, dtype=torch.float32)
+        out = (x_route, x_dust, torch.tensor(y, dtype=torch.float32))
+        if self.weight_cfg is not None:                        # training loaders only: per-sample loss weight
+            thr, extra = self.weight_cfg
+            out += (torch.tensor(1.0 + extra * float(y_raw > thr), dtype=torch.float32),)
+        return out
 
 
 # =========================================================
 # 9) TRAINING
 # =========================================================
-def _step(model, station, x_route, x_dust, y, device, optimizer):
+def _step(model, station, x_route, x_dust, y, device, optimizer, w=None):
     """One forward(+backward) pass through a single station's head. Returns (loss_value, batch_size)."""
     x_route = x_route.to(device, non_blocking=True)  # [B, T_in, C_r, H, W]
     x_dust  = x_dust.to(device, non_blocking=True)    # [B, T_dust, 2, H_d, W_d]
     y       = y.to(device, non_blocking=True)          # [B]
 
     y_hat = model(x_dust, x_route, station=station, return_attn=False)  # [B, 1]
-    loss  = F.mse_loss(y_hat.squeeze(-1), y)
+    if w is None:
+        loss = F.mse_loss(y_hat.squeeze(-1), y)
+    else:                                                       # weighted MSE (dust events count more)
+        w = w.to(device, non_blocking=True)
+        loss = (w * (y_hat.squeeze(-1) - y) ** 2).sum() / w.sum()
 
     if optimizer is not None:
         optimizer.zero_grad()
@@ -540,10 +647,10 @@ def run_epoch(model, loader, device, station, optimizer=None):
     ctx = torch.enable_grad() if is_train else torch.no_grad()
 
     with ctx:
-        for batch_idx, (x_route, x_dust, y) in enumerate(
+        for batch_idx, (x_route, x_dust, y, *_w) in enumerate(
             tqdm(loader, desc=f"{'train' if is_train else 'val'}:{station}", leave=False)
         ):
-            loss_val, bs = _step(model, station, x_route, x_dust, y, device, optimizer)
+            loss_val, bs = _step(model, station, x_route, x_dust, y, device, optimizer, _w[0] if (_w and is_train) else None)
             if is_train:
                 print(f"  [{station}] batch {batch_idx + 1}/{len(loader)}  MSE={loss_val:.4f}")
             total_loss += loss_val * bs
@@ -574,15 +681,15 @@ def run_multitask_train_epoch(model, primary_name, primary_loader, aux_loaders, 
 
     total_loss, n = 0.0, 0
     pbar = tqdm(primary_loader, desc=f"train:{primary_name}(+aux)", leave=False)
-    for batch_idx, (x_route, x_dust, y) in enumerate(pbar):
-        loss_val, bs = _step(model, primary_name, x_route, x_dust, y, device, optimizer)
+    for batch_idx, (x_route, x_dust, y, *_w) in enumerate(pbar):
+        loss_val, bs = _step(model, primary_name, x_route, x_dust, y, device, optimizer, _w[0] if _w else None)
         total_loss += loss_val * bs
         n += bs
         log = f"  [{primary_name}] batch {batch_idx + 1}/{len(primary_loader)}  MSE={loss_val:.4f}"
 
         for name, it in aux_iters.items():
-            xr_, xd_, y_ = next(it)
-            aux_loss, _ = _step(model, name, xr_, xd_, y_, device, optimizer)
+            xr_, xd_, y_, *_wa = next(it)
+            aux_loss, _ = _step(model, name, xr_, xd_, y_, device, optimizer, _wa[0] if _wa else None)
             log += f"  |  [{name}] MSE={aux_loss:.4f}"
 
         print(log)
@@ -613,12 +720,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config",   default="config.yaml", help="Path to YAML config file")
     parser.add_argument("--run_name", default=None,          help="Run name (overrides config)")
+    parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
+                        help="Override config keys, e.g. --set target_anomaly=true target_transform=log high_aod_weight=3")
     parser.add_argument("--n_folds",  type=int, default=None, help="Cross-validation: number of contiguous time blocks")
     parser.add_argument("--val_fold", type=int, default=None, help="Cross-validation: which block (0-based) is the val set")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     apply_split_override(cfg, args.n_folds, args.val_fold)
+    for kv in args.set:
+        k, v = kv.split("=", 1)
+        cfg[k] = yaml.safe_load(v)
     if args.run_name:
         cfg["run_name"]       = args.run_name
         cfg["checkpoint_dir"] = f"outputs/{args.run_name}"
@@ -801,6 +913,32 @@ def main():
                                             num_workers=0, pin_memory=device.type == "cuda")
 
     # ----------------------------------------------------------
+    # Target transform (what the model predicts) — fitted on TRAINING days only, per station.
+    #   target_transform: none | log | sqrt     target_anomaly: false | true (subtract the day-of-year climatology)
+    #   high_aod_weight: extra loss weight for samples with raw AOD > event_thr (0 = off)
+    #   event_thr: AOD above which a day counts as a dust "event" in the val scores
+    #   select_metric: loss (default, val loss in target space) | aod_mse | f1 | r2_anom   -> which val score picks best.pt
+    # All defaults reproduce the earlier behaviour (raw AOD, plain MSE, best.pt by val loss).
+    # ----------------------------------------------------------
+    tf_kind    = cfg.get("target_transform", "none")
+    tf_anomaly = bool(cfg.get("target_anomaly", False))
+    event_thr  = float(cfg.get("event_thr", 0.3))
+    hw         = float(cfg.get("high_aod_weight", 0.0))
+    weight_cfg = (event_thr, hw) if hw > 0 else None
+    tr_dates = [primary_full.sample_dates[i] for i in train_idx]
+    tr_raw   = [primary_full.samples[i][1] for i in train_idx]
+    tf       = TargetTransform.fit(tf_kind, tf_anomaly, tr_dates, tr_raw)
+    clim_raw = TargetTransform.fit("none", True, tr_dates, tr_raw).clim     # AOD-space climatology, for anomaly scores
+    primary_full.set_target_tf(tf, weight_cfg)
+    for name, ld in aux_loaders.items():
+        a_ds = ld.dataset
+        a_ds.set_target_tf(TargetTransform.fit(tf_kind, tf_anomaly, a_ds.sample_dates, [x[1] for x in a_ds.samples]), weight_cfg)
+    print(f"[target] transform={tf_kind}  anomaly={tf_anomaly}  high_aod_weight={hw} (AOD>{event_thr})  "
+          f"select_metric={cfg.get('select_metric', 'loss')}")
+    val_dates = [primary_full.sample_dates[i] for i in val_idx]
+    val_obs   = np.array([primary_full.samples[i][1] for i in val_idx])
+
+    # ----------------------------------------------------------
     # Model — shared backbone, one regression head per station. Only
     # heads[PRIMARY_NAME] is ever used for validation/inference.
     # ----------------------------------------------------------
@@ -845,6 +983,16 @@ def main():
         print(f"Epoch {epoch:3d}/{num_epochs}  "
               f"train_MSE={train_loss:.4f}  val_MSE={val_loss:.4f}  lr={lr_now:.2e}")
 
+        score = val_loss
+        if cfg.get("eval_aod", True):
+            m = aod_metrics(predict_aod(model, val_loader, device, PRIMARY_NAME, val_dates, tf),
+                            val_obs, val_dates, clim_raw, event_thr)
+            print(f"           val(AOD units): RMSE={m['rmse']:.4f} R2={m['r2']:.3f} r={m['r']:.3f}  "
+                  f"anomaly: R2={m['r2_anom']:.3f} r={m['r_anom']:.3f}  |  events AOD>{event_thr} (n={m['n_event']}): "
+                  f"POD={m['pod']:.2f} FAR={m['far']:.2f} F1={m['f1']:.2f} MSE_hi={m['mse_hi']:.4f} bias_hi={m['bias_hi']:+.3f}")
+            sel = cfg.get("select_metric", "loss")
+            score = {"loss": val_loss, "aod_mse": m["rmse"] ** 2, "f1": -m["f1"], "r2_anom": -m["r2_anom"]}[sel]
+
         if epoch == 1:
             ckpt_e1 = CHECKPOINT_DIR / "epoch1.pt"
             torch.save({
@@ -856,11 +1004,12 @@ def main():
                 "station_names": STATION_NAMES,
                 "inference_station": PRIMARY_NAME,
                 "config": cfg,
+                "target_tf": tf.to_dict(),
             }, ckpt_e1)
             print(f"           ✓ saved epoch-1 checkpoint")
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if score < best_val_loss:
+            best_val_loss = score
             ckpt = CHECKPOINT_DIR / "best.pt"
             torch.save({
                 "epoch": epoch,
@@ -871,10 +1020,11 @@ def main():
                 "station_names": STATION_NAMES,
                 "inference_station": PRIMARY_NAME,
                 "config": cfg,
+                "target_tf": tf.to_dict(),
             }, ckpt)
-            print(f"           ✓ saved best checkpoint (val_MSE={val_loss:.4f})")
+            print(f"           ✓ saved best checkpoint (val_MSE={val_loss:.4f}, select={cfg.get('select_metric', 'loss')}={score:.4f})")
 
-    print(f"\nTraining complete. Best val MSE: {best_val_loss:.4f}")
+    print(f"\nTraining complete. Best val score ({cfg.get('select_metric', 'loss')}): {best_val_loss:.4f}")
     print(f"Best checkpoint: {CHECKPOINT_DIR / 'best.pt'}")
 
 

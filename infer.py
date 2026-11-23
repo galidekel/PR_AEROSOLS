@@ -18,7 +18,7 @@ from pr_VIT_dustmeteo import PRAfricaDustRouteMeteoNet
 from train_main import (
     load_config, load_all_files, load_norm_stats,
     crop_area, build_route_dataset, build_dust_dataset,
-    load_station_targets, PRLazyDataset, make_split, apply_split_override,
+    load_station_targets, PRLazyDataset, make_split, apply_split_override, TargetTransform,
 )
 from pathlib import Path
 
@@ -126,6 +126,9 @@ def main():
     if missing:
         log(f"missing keys (will use random init): {missing}")
     model.eval()
+    tf = TargetTransform.from_dict(ckpt.get("target_tf"))      # identity for runs trained before this option existed
+    if not tf.identity:
+        log(f"target transform: kind={tf.kind} anomaly={tf.anomaly} -> predictions are converted back to AOD")
     log("model loaded — starting inference")
 
     # ── Collect dates for each val sample ─────────────────────────────────────
@@ -155,6 +158,9 @@ def main():
             y_hat = model(x_dust, x_route, station=inference_station, return_attn=False)
             preds = y_hat.squeeze(-1).cpu().numpy()
             tgts  = y.numpy()
+            if not tf.identity:
+                _s = batch_idx * cfg["batch_size"]
+                preds = tf.inverse(val_dates[_s : _s + len(preds)], preds)
 
             # De-normalize the dust input and average over time+space per
             # sample, so we can compare the raw CAMS signal to pred/target.

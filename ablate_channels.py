@@ -40,7 +40,7 @@ from pr_VIT_dustmeteo import PRAfricaDustRouteMeteoNet
 from train_main import (
     load_config, load_all_files, load_norm_stats,
     crop_area, build_route_dataset, build_dust_dataset,
-    load_station_targets, PRLazyDataset, make_split, apply_split_override,
+    load_station_targets, PRLazyDataset, make_split, apply_split_override, TargetTransform,
 )
 
 DEFAULT_SPECS = ["pv_700", "pv_900", "pv_850", "pv_*", "t_700", "t_850", "t_500", "z_500", "dust"]
@@ -164,12 +164,18 @@ def main():
     se_base = np.zeros(n_val)
     se_abl = {k: np.zeros((n_rep, n_val)) for k in specs}
 
+    tf = TargetTransform.from_dict(ckpt.get("target_tf"))      # identity for runs trained without a target transform
+    vdates = [full.sample_dates[i] for i in val_idx]
+    cur = {"ids": []}
+
     @torch.no_grad()
     def predict(xd, xr):
-        return model(xd, xr, station=inference_station, return_attn=False).squeeze(-1).cpu().numpy()
+        p = model(xd, xr, station=inference_station, return_attn=False).squeeze(-1).cpu().numpy()
+        return p if tf.identity else tf.inverse([vdates[i] for i in cur["ids"]], p)   # always compare in AOD units
 
     for start in range(0, n_val, B):
         ids = list(range(start, min(start + B, n_val)))
+        cur["ids"] = ids
         xr = torch.stack([val_ds[i][0] for i in ids]).to(device)
         xd = torch.stack([val_ds[i][1] for i in ids]).to(device)
         y = y_all[ids]
