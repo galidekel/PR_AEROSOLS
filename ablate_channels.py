@@ -56,7 +56,13 @@ def main():
     parser.add_argument("--config", default="config_hpc.yaml")
     parser.add_argument("--out_dir", default="ablation_out")
     parser.add_argument("--channels", nargs="*", default=DEFAULT_SPECS)
-    parser.add_argument("--mode", choices=["shuffle", "zero"], default="shuffle")
+    parser.add_argument("--mode", choices=["shuffle", "shuffle_season", "zero"], default="shuffle",
+                        help="shuffle: donor = random other val day.  shuffle_season: donor = a val day at the SAME time "
+                             "of year (+/- --season_window days) but >= --min_gap_days away, so the seasonal cycle is kept "
+                             "and only the day-to-day anomaly is destroyed.  zero: set to the training mean.")
+    parser.add_argument("--season_window", type=int, default=15, help="shuffle_season: max circular day-of-year distance")
+    parser.add_argument("--min_gap_days", type=int, default=8, help="shuffle_season: donor must be at least this many days "
+                        "from the target day (avoids the same dust event / autocorrelated neighbours)")
     parser.add_argument("--n_repeats", type=int, default=3, help="Shuffle pairings to average (shuffle mode)")
     parser.add_argument("--n_boot", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
@@ -133,8 +139,25 @@ def main():
     log(f"ablating: { {k: (v if v == 'dust' else len(v)) for k, v in specs.items()} }  (mode={args.mode})")
 
     rng = np.random.default_rng(args.seed)
-    n_rep = args.n_repeats if args.mode == "shuffle" else 1
-    perms = [rng.permutation(n_val) for _ in range(n_rep)]
+    use_donor = args.mode in ("shuffle", "shuffle_season")
+    n_rep = args.n_repeats if use_donor else 1
+    if args.mode == "shuffle_season":
+        vd = pd.DatetimeIndex([full.sample_dates[i] for i in val_idx])
+        doy = vd.dayofyear.values
+        circ = np.abs(doy[:, None] - doy[None, :]); circ = np.minimum(circ, 365 - circ)
+        gap = np.abs((vd.values[:, None] - vd.values[None, :]).astype("timedelta64[D]").astype(int))
+        cands = []
+        for i in range(n_val):
+            c = np.where((circ[i] <= args.season_window) & (gap[i] >= args.min_gap_days))[0]
+            if len(c) == 0:                       # nothing that close in season (edge of the val window): widen
+                c = np.where(gap[i] >= args.min_gap_days)[0]
+                c = c[np.argsort(circ[i][c])[:5]]
+            cands.append(c)
+        log(f"shuffle_season: donors per val day: median={int(np.median([len(c) for c in cands]))} "
+            f"min={min(len(c) for c in cands)} (window +/-{args.season_window} d of year, >= {args.min_gap_days} d apart)")
+        perms = [np.array([rng.choice(c) for c in cands]) for _ in range(n_rep)]
+    else:
+        perms = [rng.permutation(n_val) for _ in range(n_rep)]
 
     B = cfg["batch_size"]
     y_all = np.array([full.samples[val_idx[i]][1] for i in range(n_val)])   # targets only; no data loading
@@ -153,17 +176,17 @@ def main():
         se_base[ids] = (predict(xd, xr) - y) ** 2
 
         for r in range(n_rep):
-            if args.mode == "shuffle":
+            if use_donor:
                 donors = [int(perms[r][i]) for i in ids]
                 dr = torch.stack([val_ds[j][0] for j in donors]).to(device)
                 dd = torch.stack([val_ds[j][1] for j in donors]).to(device)
             for k, v in specs.items():
                 if v == "dust":
-                    xd_m = dd if args.mode == "shuffle" else torch.zeros_like(xd)
+                    xd_m = dd if use_donor else torch.zeros_like(xd)
                     pred = predict(xd_m, xr)
                 else:
                     xr_m = xr.clone()                           # [B, T_in, C_r, H, W]
-                    xr_m[:, :, v] = dr[:, :, v] if args.mode == "shuffle" else 0.0
+                    xr_m[:, :, v] = dr[:, :, v] if use_donor else 0.0
                     pred = predict(xd, xr_m)
                 se_abl[k][r, ids] = (pred - y) ** 2
         log(f"batch {start // B + 1}/{int(np.ceil(n_val / B))}")
