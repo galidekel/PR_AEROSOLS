@@ -263,6 +263,14 @@ def load_station_targets(station_cfg, default_agg="median"):
         raise ValueError(f"Unknown AERONET format {fmt!r} for station {station_cfg['name']!r}; "
                           f"expected one of {list(_AERONET_PARSERS)}")
 
+    cols = station_cfg.get("target_cols")
+    if cols:        # several outputs (e.g. AOD 500/870/1020): keep only days where ALL of them are valid
+        daily = pd.concat({c: parser(station_cfg["path"], target_col=c, agg=agg) for c in cols}, axis=1, join="inner")
+        print(f"[targets:{station_cfg['name']}] {len(daily)} days with all of {list(cols)}")
+        print(f"[targets:{station_cfg['name']}] mean={daily.mean().round(4).to_dict()}  "
+              f"baseline_MSE={daily.var().round(4).to_dict()}")
+        return daily
+
     daily = parser(station_cfg["path"], target_col=col, agg=agg)
     print(f"[targets:{station_cfg['name']}] {len(daily)} valid days  "
           f"({daily.index[0].date()} → {daily.index[-1].date()})  fmt={fmt}")
@@ -324,6 +332,21 @@ def load_norm_stats(path):
 # =========================================================
 # 8) LAZY PYTORCH DATASET
 # =========================================================
+def load_dust_flag(station_cfg, dw, default_agg="median"):
+    """
+    {day: True/False} = AERONET "dust-like" day of this station: AOD500 > dw["aod_min"] AND Angstrom exponent < dw["ae_max"]
+    (exponent between the wavelengths dw["ae_pair"], default 440 and 1020 nm), from the station's own AERONET file.
+    Days where one of the three AODs is missing are absent (-> normal weight 1).
+    """
+    w1, w2 = dw.get("ae_pair", [440, 1020])
+    col = (lambda w: f"AOD_{w}nm-AOD") if station_cfg.get("format", "tot_lev20") == "tot_lev20" else (lambda w: f"AOD_{w}nm")
+    cfg = dict(station_cfg); cfg["target_cols"] = [col(500), col(w1), col(w2)]
+    df = load_station_targets(cfg, default_agg=default_agg); df.columns = ["t500", "t1", "t2"]
+    ae = -np.log(df.t1 / df.t2) / np.log(w1 / w2)
+    flag = (df.t500 > dw["aod_min"]) & (ae < dw["ae_max"])
+    return {pd.Timestamp(t).normalize(): bool(v) for t, v in flag.items()}
+
+
 def apply_split_override(cfg, n_folds=None, val_fold=None, ckpt_path=None):
     """Which train/val split to use. Priority: CLI args > split.json next to the checkpoint > config."""
     import json
@@ -394,7 +417,7 @@ class TargetTransform:
     """
 
     def __init__(self, kind="none", anomaly=False, mu=0.0, clim=None):
-        self.kind, self.anomaly, self.mu = kind, bool(anomaly), float(mu)
+        self.kind, self.anomaly, self.mu = kind, bool(anomaly), np.asarray(mu, dtype=float)
         self.clim = None if clim is None else np.asarray(clim, dtype=float)
 
     @property
@@ -413,15 +436,15 @@ class TargetTransform:
 
     @classmethod
     def fit(cls, kind, anomaly, dates, raw, smooth=21):
-        z = cls._t(raw, kind)
+        z = cls._t(raw, kind)                              # [N] (one output) or [N, K] (K outputs)
         if anomaly:
-            ser = pd.Series(z, index=pd.DatetimeIndex(dates))
-            clim = ser.groupby(ser.index.dayofyear).mean().reindex(range(1, 367)).interpolate(limit_direction="both").values
+            frame = pd.DataFrame(z.reshape(len(z), -1), index=pd.DatetimeIndex(dates))
+            clim = frame.groupby(frame.index.dayofyear).mean().reindex(range(1, 367)).interpolate(limit_direction="both").values
             pad = smooth                                   # circular smoothing: Dec 31 and Jan 1 are neighbours
-            padded = np.concatenate([clim[-pad:], clim, clim[:pad]])
-            clim = pd.Series(padded).rolling(smooth, center=True, min_periods=1).mean().values[pad:-pad]
-            return cls(kind, True, 0.0, clim)
-        return cls(kind, False, float(np.mean(z)) if kind != "none" else 0.0, None)
+            padded = np.concatenate([clim[-pad:], clim, clim[:pad]], axis=0)
+            clim = pd.DataFrame(padded).rolling(smooth, center=True, min_periods=1).mean().values[pad:-pad]
+            return cls(kind, True, 0.0, clim[:, 0] if z.ndim == 1 else clim)
+        return cls(kind, False, z.mean(axis=0) if kind != "none" else 0.0, None)
 
     def offset(self, dates):
         if self.anomaly:
@@ -435,7 +458,7 @@ class TargetTransform:
         return self._inv(np.asarray(y, dtype=float) + self.offset(dates), self.kind)
 
     def to_dict(self):
-        return {"kind": self.kind, "anomaly": self.anomaly, "mu": self.mu,
+        return {"kind": self.kind, "anomaly": self.anomaly, "mu": self.mu.tolist(),
                 "clim": None if self.clim is None else self.clim.tolist()}
 
     @classmethod
@@ -449,26 +472,41 @@ def predict_aod(model, loader, device, station, dates, tf):
     model.eval()
     preds = []
     for batch in loader:
-        x_route, x_dust = batch[0].to(device), batch[1].to(device)
-        preds.append(model(x_dust, x_route, station=station, return_attn=False).squeeze(-1).cpu().numpy())
+        x_route, x_dust, _, doy, _ = unpack_batch(batch, model.use_doy)
+        x_route, x_dust = x_route.to(device), x_dust.to(device)
+        preds.append(model(x_dust, x_route, station=station, return_attn=False,
+                           doy=None if doy is None else doy.to(device)).squeeze(-1).cpu().numpy())
     return tf.inverse(dates, np.concatenate(preds))
 
 
-def aod_metrics(pred, obs, dates, clim_raw, thr):
-    """Val metrics in AOD units: error, skill, skill on the anomaly (vs the seasonal climatology), dust-EVENT scores."""
-    obs, pred = np.asarray(obs, float), np.asarray(pred, float)
+def _metrics_1d(pred, obs, dates, clim, thr=None):
     mse = float(np.mean((pred - obs) ** 2)); var = float(np.var(obs))
     out = {"rmse": mse ** 0.5, "r2": 1 - mse / (var + 1e-12), "r": float(np.corrcoef(pred, obs)[0, 1])}
-    if clim_raw is not None:
-        cl = clim_raw[pd.DatetimeIndex(dates).dayofyear.values - 1]
-        out["r2_anom"] = 1 - float(np.mean((pred - obs) ** 2)) / (float(np.mean((obs - cl) ** 2)) + 1e-12)
+    if clim is not None:
+        cl = clim[pd.DatetimeIndex(dates).dayofyear.values - 1]
+        out["r2_anom"] = 1 - mse / (float(np.mean((obs - cl) ** 2)) + 1e-12)
         out["r_anom"] = float(np.corrcoef(pred - cl, obs - cl)[0, 1])
-    ev, pe = obs > thr, pred > thr                       # dust EVENTS = observed AOD above the threshold
-    tp, fn, fp = int((ev & pe).sum()), int((ev & ~pe).sum()), int((~ev & pe).sum())
-    out.update(n_event=int(ev.sum()), pod=tp / max(tp + fn, 1), far=fp / max(tp + fp, 1),
-               f1=2 * tp / max(2 * tp + fp + fn, 1),
-               mse_hi=float(np.mean((pred[ev] - obs[ev]) ** 2)) if ev.any() else float("nan"),
-               bias_hi=float(np.mean(pred[ev] - obs[ev])) if ev.any() else float("nan"))
+    if thr is not None:
+        ev, pe = obs > thr, pred > thr                   # dust EVENTS = observed AOD above the threshold
+        tp, fn, fp = int((ev & pe).sum()), int((ev & ~pe).sum()), int((~ev & pe).sum())
+        out.update(n_event=int(ev.sum()), pod=tp / max(tp + fn, 1), far=fp / max(tp + fp, 1),
+                   f1=2 * tp / max(2 * tp + fp + fn, 1),
+                   mse_hi=float(np.mean((pred[ev] - obs[ev]) ** 2)) if ev.any() else float("nan"),
+                   bias_hi=float(np.mean(pred[ev] - obs[ev])) if ev.any() else float("nan"))
+    return out
+
+
+def aod_metrics(pred, obs, dates, clim_raw, thr):
+    """Val metrics in AOD units. Output 0 is the primary one (event scores use it); with several outputs the
+    result also has "per" = one metrics dict per output, and "nmse" = mean over outputs of (1 - R2)."""
+    pred, obs = np.asarray(pred, float), np.asarray(obs, float)
+    if pred.ndim == 1:
+        return _metrics_1d(pred, obs, dates, clim_raw, thr)
+    per = [_metrics_1d(pred[:, k], obs[:, k], dates, None if clim_raw is None else clim_raw[:, k],
+                       thr if k == 0 else None) for k in range(pred.shape[1])]
+    out = dict(per[0])
+    out["per"] = per
+    out["nmse"] = float(np.mean([1 - p["r2"] for p in per]))
     return out
 
 
@@ -495,7 +533,10 @@ class PRLazyDataset(Dataset):
     ):
         self.station_name = station_name
         self.target_tf  = target_tf
+        self.use_doy    = False   # set via set_use_doy(): item gets a 4th element (sin, cos) of the target day's day-of-year
         self.weight_cfg = weight_cfg
+        self.dust_flag  = None        # {date: bool}: AERONET "dust-like" day (see load_dust_flag) -> extra loss weight
+        self.dust_extra = 0.0
         self.T_in       = T_in
         self.T_dust     = T_dust
         self.route_mean = route_mean
@@ -564,7 +605,8 @@ class PRLazyDataset(Dataset):
             if exclude_range is not None and exclude_range[0] <= t_target <= exclude_range[1]:
                 n_skipped_leakage += 1
                 continue
-            self.samples.append((i, float(targets.loc[t_target])))
+            _row = targets.loc[t_target]
+            self.samples.append((i, _row.values.astype(float) if isinstance(_row, pd.Series) else float(_row)))
             self.sample_dates.append(t_target)
 
         label = f":{station_name}" if station_name else ""
@@ -574,14 +616,20 @@ class PRLazyDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def set_use_doy(self, on=True):
+        self.use_doy = bool(on)
+
     def set_target_tf(self, tf, weight_cfg=None):
         self.target_tf, self.weight_cfg = tf, weight_cfg
+
+    def set_dust_weight(self, flag, extra):
+        self.dust_flag, self.dust_extra = flag, float(extra)
 
     def __getitem__(self, idx):
         i, y_raw = self.samples[idx]
         y = y_raw
         if self.target_tf is not None and not self.target_tf.identity:
-            y = float(self.target_tf.forward([self.sample_dates[idx]], [y_raw])[0])
+            y = self.target_tf.forward([self.sample_dates[idx]], np.asarray([y_raw]))[0]
 
         if self.use_memmap:
             x_route = torch.from_numpy(
@@ -606,28 +654,52 @@ class PRLazyDataset(Dataset):
         if self.dust_mean is not None:
             x_dust = (x_dust - self.dust_mean) / (self.dust_std + 1e-6)
 
-        out = (x_route, x_dust, torch.tensor(y, dtype=torch.float32))
-        if self.weight_cfg is not None:                        # training loaders only: per-sample loss weight
-            thr, extra = self.weight_cfg
-            out += (torch.tensor(1.0 + extra * float(y_raw > thr), dtype=torch.float32),)
+        out = (x_route, x_dust, torch.as_tensor(y, dtype=torch.float32))
+        if self.use_doy:
+            out += (doy_feature(self.sample_dates[idx]),)
+        if self.weight_cfg is not None or self.dust_flag is not None:   # training loaders only: per-sample loss weight
+            w = 1.0
+            if self.weight_cfg is not None:                              # high-AOD weighting (AOD500 > threshold)
+                thr, extra = self.weight_cfg
+                w += extra * float(np.atleast_1d(y_raw)[0] > thr)
+            if self.dust_flag is not None:                               # AERONET dust-like day (AOD and Angstrom rule)
+                w += self.dust_extra * float(self.dust_flag.get(self.sample_dates[idx], False))
+            out += (torch.tensor(w, dtype=torch.float32),)
         return out
 
 
 # =========================================================
 # 9) TRAINING
 # =========================================================
-def _step(model, station, x_route, x_dust, y, device, optimizer, w=None):
+def doy_feature(date):
+    """(sin, cos) of the day of year: a circular encoding, Dec 31 and Jan 1 are neighbours."""
+    th = 2 * np.pi * (pd.Timestamp(date).dayofyear - 1) / 365.25
+    return torch.tensor([np.sin(th), np.cos(th)], dtype=torch.float32)
+
+
+def unpack_batch(batch, use_doy):
+    """(x_route, x_dust, y, doy_or_None, w_or_None) from a dataset batch: (xr, xd, y[, doy][, w])."""
+    rest = list(batch[3:])
+    doy = rest.pop(0) if use_doy else None
+    return batch[0], batch[1], batch[2], doy, (rest[0] if rest else None)
+
+
+def _step(model, station, x_route, x_dust, y, device, optimizer, w=None, doy=None):
     """One forward(+backward) pass through a single station's head. Returns (loss_value, batch_size)."""
     x_route = x_route.to(device, non_blocking=True)  # [B, T_in, C_r, H, W]
     x_dust  = x_dust.to(device, non_blocking=True)    # [B, T_dust, 2, H_d, W_d]
     y       = y.to(device, non_blocking=True)          # [B]
 
-    y_hat = model(x_dust, x_route, station=station, return_attn=False)  # [B, 1]
+    y_hat = model(x_dust, x_route, station=station, return_attn=False,
+                  doy=None if doy is None else doy.to(device))  # [B, 1]
     if w is None:
         loss = F.mse_loss(y_hat.squeeze(-1), y)
     else:                                                       # weighted MSE (dust events count more)
         w = w.to(device, non_blocking=True)
-        loss = (w * (y_hat.squeeze(-1) - y) ** 2).sum() / w.sum()
+        err2 = (y_hat.squeeze(-1) - y) ** 2
+        if err2.ndim > 1:                                       # several outputs: average them per sample
+            err2 = err2.mean(dim=-1)
+        loss = (w * err2).sum() / w.sum()
 
     if optimizer is not None:
         optimizer.zero_grad()
@@ -647,10 +719,11 @@ def run_epoch(model, loader, device, station, optimizer=None):
     ctx = torch.enable_grad() if is_train else torch.no_grad()
 
     with ctx:
-        for batch_idx, (x_route, x_dust, y, *_w) in enumerate(
+        for batch_idx, batch in enumerate(
             tqdm(loader, desc=f"{'train' if is_train else 'val'}:{station}", leave=False)
         ):
-            loss_val, bs = _step(model, station, x_route, x_dust, y, device, optimizer, _w[0] if (_w and is_train) else None)
+            x_route, x_dust, y, doy, w_ = unpack_batch(batch, model.use_doy)
+            loss_val, bs = _step(model, station, x_route, x_dust, y, device, optimizer, w_ if is_train else None, doy=doy)
             if is_train:
                 print(f"  [{station}] batch {batch_idx + 1}/{len(loader)}  MSE={loss_val:.4f}")
             total_loss += loss_val * bs
@@ -681,15 +754,16 @@ def run_multitask_train_epoch(model, primary_name, primary_loader, aux_loaders, 
 
     total_loss, n = 0.0, 0
     pbar = tqdm(primary_loader, desc=f"train:{primary_name}(+aux)", leave=False)
-    for batch_idx, (x_route, x_dust, y, *_w) in enumerate(pbar):
-        loss_val, bs = _step(model, primary_name, x_route, x_dust, y, device, optimizer, _w[0] if _w else None)
+    for batch_idx, batch in enumerate(pbar):
+        x_route, x_dust, y, doy, w_ = unpack_batch(batch, model.use_doy)
+        loss_val, bs = _step(model, primary_name, x_route, x_dust, y, device, optimizer, w_, doy=doy)
         total_loss += loss_val * bs
         n += bs
         log = f"  [{primary_name}] batch {batch_idx + 1}/{len(primary_loader)}  MSE={loss_val:.4f}"
 
         for name, it in aux_iters.items():
-            xr_, xd_, y_, *_wa = next(it)
-            aux_loss, _ = _step(model, name, xr_, xd_, y_, device, optimizer, _wa[0] if _wa else None)
+            xr_, xd_, y_, doy_, w_a = unpack_batch(next(it), model.use_doy)
+            aux_loss, _ = _step(model, name, xr_, xd_, y_, device, optimizer, w_a, doy=doy_)
             log += f"  |  [{name}] MSE={aux_loss:.4f}"
 
         print(log)
@@ -920,6 +994,11 @@ def main():
     #   select_metric: loss (default, val loss in target space) | aod_mse | f1 | r2_anom   -> which val score picks best.pt
     # All defaults reproduce the earlier behaviour (raw AOD, plain MSE, best.pt by val loss).
     # ----------------------------------------------------------
+    n_out = len(cfg["stations"][0].get("target_cols") or [None])
+    for st in cfg["stations"]:
+        assert len(st.get("target_cols") or [None]) == n_out, \
+            f"station {st['name']} has a different number of target_cols; all heads share out_dim={n_out}"
+    cfg["out_dim"] = n_out                        # one output per target column (1 = the original single AOD500 target)
     tf_kind    = cfg.get("target_transform", "none")
     tf_anomaly = bool(cfg.get("target_anomaly", False))
     event_thr  = float(cfg.get("event_thr", 0.3))
@@ -935,8 +1014,20 @@ def main():
         a_ds.set_target_tf(TargetTransform.fit(tf_kind, tf_anomaly, a_ds.sample_dates, [x[1] for x in a_ds.samples]), weight_cfg)
     print(f"[target] transform={tf_kind}  anomaly={tf_anomaly}  high_aod_weight={hw} (AOD>{event_thr})  "
           f"select_metric={cfg.get('select_metric', 'loss')}")
+    dw = cfg.get("dust_weight")      # {aod_min, ae_max, extra[, ae_pair]}: dust-like days get loss weight 1 + extra
+    if dw:
+        for st in STATIONS:
+            flag = load_dust_flag(st, dw, default_agg=cfg.get("target_agg", "median"))
+            ds_ = primary_full if st["name"] == PRIMARY_NAME else aux_loaders[st["name"]].dataset
+            ds_.set_dust_weight(flag, dw["extra"])
+            days = [primary_full.sample_dates[i] for i in train_idx] if st["name"] == PRIMARY_NAME else ds_.sample_dates
+            n_f = sum(flag.get(t, False) for t in days)
+            print(f"[dust_weight] {st['name']}: {n_f} of {len(days)} training days are dust-like "
+                  f"(AOD500>{dw['aod_min']} & AE<{dw['ae_max']}) -> weight {1 + float(dw['extra']):g}x")
     val_dates = [primary_full.sample_dates[i] for i in val_idx]
-    val_obs   = np.array([primary_full.samples[i][1] for i in val_idx])
+    val_obs   = np.array([primary_full.samples[i][1] for i in val_idx])        # [N] or [N, n_out]
+    out_names = list(cfg["stations"][0].get("target_cols") or [cfg["stations"][0].get("target_col", "AOD")])
+    print(f"[target] outputs ({n_out}): {out_names}")
 
     # ----------------------------------------------------------
     # Model — shared backbone, one regression head per station. Only
@@ -954,7 +1045,13 @@ def main():
         T_in=T_IN,
         H_route=route_da.shape[2],
         W_route=route_da.shape[3],
+        use_doy=bool(cfg.get("use_doy", False)),
     ).to(device)
+    if cfg.get("use_doy", False):
+        primary_full.set_use_doy(True)
+        for ld in aux_loaders.values():
+            ld.dataset.set_use_doy(True)
+        print("[model] use_doy: day-of-year (sin, cos) token added to Gate 2")
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] {n_params:,} trainable parameters")
@@ -987,11 +1084,15 @@ def main():
         if cfg.get("eval_aod", True):
             m = aod_metrics(predict_aod(model, val_loader, device, PRIMARY_NAME, val_dates, tf),
                             val_obs, val_dates, clim_raw, event_thr)
-            print(f"           val(AOD units): RMSE={m['rmse']:.4f} R2={m['r2']:.3f} r={m['r']:.3f}  "
-                  f"anomaly: R2={m['r2_anom']:.3f} r={m['r_anom']:.3f}  |  events AOD>{event_thr} (n={m['n_event']}): "
-                  f"POD={m['pod']:.2f} FAR={m['far']:.2f} F1={m['f1']:.2f} MSE_hi={m['mse_hi']:.4f} bias_hi={m['bias_hi']:+.3f}")
+            per = m.get("per") or [m]
+            for nm, p in zip(out_names, per):
+                print(f"           val(AOD units) {nm}: RMSE={p['rmse']:.4f} R2={p['r2']:.3f} r={p['r']:.3f}  "
+                      f"anomaly: R2={p['r2_anom']:.3f} r={p['r_anom']:.3f}")
+            print(f"           events {out_names[0]} > {event_thr} (n={m['n_event']}): POD={m['pod']:.2f} FAR={m['far']:.2f} "
+                  f"F1={m['f1']:.2f} MSE_hi={m['mse_hi']:.4f} bias_hi={m['bias_hi']:+.3f}")
             sel = cfg.get("select_metric", "loss")
-            score = {"loss": val_loss, "aod_mse": m["rmse"] ** 2, "f1": -m["f1"], "r2_anom": -m["r2_anom"]}[sel]
+            score = {"loss": val_loss, "aod_mse": m["rmse"] ** 2, "f1": -m["f1"], "r2_anom": -m["r2_anom"],
+                     "nmse": m.get("nmse", 1 - m["r2"])}[sel]
 
         if epoch == 1:
             ckpt_e1 = CHECKPOINT_DIR / "epoch1.pt"

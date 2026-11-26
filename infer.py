@@ -18,7 +18,7 @@ from pr_VIT_dustmeteo import PRAfricaDustRouteMeteoNet
 from train_main import (
     load_config, load_all_files, load_norm_stats,
     crop_area, build_route_dataset, build_dust_dataset,
-    load_station_targets, PRLazyDataset, make_split, apply_split_override, TargetTransform,
+    load_station_targets, PRLazyDataset, make_split, apply_split_override, TargetTransform, unpack_batch,
 )
 from pathlib import Path
 
@@ -53,6 +53,9 @@ def main():
         f"inference_station={inference_station!r}")
 
     primary_cfg = next(s for s in cfg["stations"] if s["name"] == inference_station)
+    USE_DOY = bool((ckpt.get("config") or {}).get("use_doy", cfg.get("use_doy", False)))
+    if USE_DOY:
+        log("model uses the day-of-year token")
 
     # ── Data pipeline (mirrors train_main.py exactly) ─────────────────────────
     ERA5_DIR = Path(cfg["era5_dir"])
@@ -103,6 +106,7 @@ def main():
     log(f"split: total={len(full_dataset)}  train={len(train_idx)}  val={len(val_ds)}  "
         f"(n_folds={cfg.get('n_folds')} val_fold={cfg.get('val_fold')})")
 
+    full_dataset.set_use_doy(USE_DOY)
     val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"], shuffle=False, num_workers=0)
 
     # ── Build model and load weights ───────────────────────────────────────────
@@ -118,6 +122,7 @@ def main():
         T_in=cfg["t_in"],
         H_route=route_da.shape[2],
         W_route=route_da.shape[3],
+        use_doy=USE_DOY,
     ).to(device)
 
     missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
@@ -141,6 +146,7 @@ def main():
     # ── Inference ─────────────────────────────────────────────────────────────
     all_preds, all_targets, all_dates = [], [], []
     all_cams_total, all_cams_dust = [], []
+    all_extra_p, all_extra_t = [], []
     limit = args.n_batches if args.n_batches > 0 else len(val_loader)
 
     print(f"\n{'Batch':>5}  {'pred_min':>9} {'pred_max':>9} {'pred_mean':>10} "
@@ -148,19 +154,24 @@ def main():
     print("-" * 80)
 
     with torch.no_grad():
-        for batch_idx, (x_route, x_dust, y) in enumerate(val_loader):
+        for batch_idx, batch in enumerate(val_loader):
             if batch_idx >= limit:
                 break
 
+            x_route, x_dust, y, doy, _ = unpack_batch(batch, USE_DOY)
             x_route = x_route.to(device)
             x_dust  = x_dust.to(device)
 
-            y_hat = model(x_dust, x_route, station=inference_station, return_attn=False)
+            y_hat = model(x_dust, x_route, station=inference_station, return_attn=False,
+                          doy=None if doy is None else doy.to(device))
             preds = y_hat.squeeze(-1).cpu().numpy()
             tgts  = y.numpy()
             if not tf.identity:
                 _s = batch_idx * cfg["batch_size"]
                 preds = tf.inverse(val_dates[_s : _s + len(preds)], preds)
+            if preds.ndim > 1:                       # several outputs: keep the rest for the CSV, report the first one
+                all_extra_p.append(preds); all_extra_t.append(tgts)
+                preds, tgts = preds[:, 0], tgts[:, 0]
 
             # De-normalize the dust input and average over time+space per
             # sample, so we can compare the raw CAMS signal to pred/target.
@@ -199,13 +210,21 @@ def main():
 
     # ── Save CSV ───────────────────────────────────────────────────────────────
     out_path = Path(args.out)
-    pd.DataFrame({
+    out_df = pd.DataFrame({
         "date":             [d.date() for d in all_dates],
         "pred":             all_preds,
         "target":           all_targets,
         "cams_total_aod":   all_cams_total,
         "cams_dust_aod":    all_cams_dust,
-    }).to_csv(out_path, index=False)
+    })
+    if all_extra_p:                                  # one pred_/target_ column pair per output (output 0 = pred/target)
+        EP, ET = np.concatenate(all_extra_p), np.concatenate(all_extra_t)
+        names = cfg["stations"][0].get("target_cols") or [f"out{k}" for k in range(EP.shape[1])]
+        for k, nm in enumerate(names):
+            out_df[f"pred_{nm}"], out_df[f"target_{nm}"] = EP[:, k], ET[:, k]
+            mse_k = float(np.mean((EP[:, k] - ET[:, k]) ** 2))
+            log(f"{nm}: MSE={mse_k:.5f}  R²={1 - mse_k / (float(np.var(ET[:, k])) + 1e-9):.4f}")
+    out_df.to_csv(out_path, index=False)
     log(f"saved {out_path}  ({len(all_preds)} rows)")
 
 

@@ -1,0 +1,82 @@
+# ── Paths ────────────────────────────────────────────────────────────────────
+era5_dir:  "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/era5_dataset"
+cams_dir:  "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/cams_dataset"
+norm_stats_path: "norm_stats_fixgrid.json"
+norm_stats_route_from: "norm_stats.json"   # route (ERA5) unchanged: reuse its mean/std, recompute only the dust stats
+memmap_dir: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/memmap_fixgrid"
+run_name: "run_3_stations_cv4_doy"
+use_doy: true   # extra Gate-2 token: (sin, cos) of the day of year
+target_agg: "median"   # daily aggregation for tot_lev20-format stations: mean | median
+
+# ── AERONET stations ─────────────────────────────────────────────────────────
+# See config.yaml for the full explanation. Exactly one "primary" station!
+# (used at inference); "auxiliary" stations only enrich the shared backbone.
+# NOTE: La_Parguera / NEON_GUAN files must be copied to this data_dir on the
+# HPC before this config can be used — they currently only exist locally!!
+stations:
+  - name: "Cape_San_Juan"
+    role: "primary"
+    format: "tot_lev20"
+    path: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/20040101_20251231_Cape_San_Juan.tot_lev20"
+    target_col: "AOD_500nm-AOD"
+    lat: 18.3845
+    lon: -65.6199
+    elev: 15.0
+  - name: "La_Parguera"
+    role: "auxiliary"
+    format: "daily_lev20"
+    path: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/La_Parguera_all_years_lev20_daily.txt"
+    target_col: "AOD_500nm"
+    lat: 17.9705
+    lon: -67.0454
+    elev: 12.4
+  - name: "NEON_GUAN"
+    role: "auxiliary"
+    format: "daily_lev20"
+    path: "/home/labs/rudich/Rudich_Collaboration/PR_AEROSOLS_DATA/NEON_GUAN_all_years_lev20_daily.txt"
+    target_col: "AOD_500nm"
+    lat: 17.9696
+    lon: -66.8687
+    elev: 128.0
+
+# File glob patterns for monthly NetCDF files
+pattern_era5_pl: "era5_pl_*.nc"
+pattern_era5_sl: "era5_sl_*.nc"
+pattern_cams:    "cams_eac4_total_dust_aod550_3h_*.nc"
+
+# ── Spatial domains  [north, west, south, east] ───────────────────────────────
+area_route:  [35, -90, -10,  30]   # Africa → Atlantic → Caribbean (ERA5)
+area_africa: [35, -17, -10,  30]   # Africa dust source region (CAMS)
+
+# ── Temporal ─────────────────────────────────────────────────────────────────
+t_step_hours: 6      # target temporal resolution (hours)
+t_in_days:    7      # route input window length (days)
+t_dust_days:  1      # dust source snapshot length (days)
+
+# ── Data loading ──────────────────────────────────────────────────────────────
+chunk_time:       64    # dask chunk size along time axis
+norm_n_samples:   200   # timesteps sampled to estimate norm stats
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+route_patch_size: [1, 20, 20]   # (temporal, lat, lon) patch size for PatchEmbed3D
+embed_dim:        256
+num_heads_space:  4
+num_heads_fusion: 4
+dropout:          0.1
+out_dim:          1             # regression: scalar AOD_500nm
+
+# ── Training ──────────────────────────────────────────────────────────────────
+batch_size:   16
+num_epochs:   50
+lr:           1.0e-4
+weight_decay: 1.0e-4
+val_frac:     0.15   # fraction of samples (by time) held out for validation
+
+# ── Cross-validation: 4 held-out 2-year CALENDAR windows, ~5.3 years apart (pick one with --val_fold 0..3) ──
+# Train = everything outside the window +/- embargo_days; auxiliary stations avoid the same period.
+embargo_days: 7
+val_windows:
+  - ["2007-01-01", "2008-12-31"]   # fold 0
+  - ["2012-04-01", "2014-03-31"]   # fold 1
+  - ["2017-09-01", "2019-08-31"]   # fold 2
+  - ["2023-01-01", "2024-12-31"]   # fold 3  (about the same period as the earlier run's val set)

@@ -236,8 +236,10 @@ class PRAfricaDustRouteMeteoNet(nn.Module):
         T_in: int = 28,
         H_route: int = 180,
         W_route: int = 480,
+        use_doy: bool = False,
     ):
         super().__init__()
+        self.use_doy = use_doy   # extra Gate-2 token from (sin, cos) of the day of year
 
         if not station_names:
             raise ValueError("station_names must contain at least one station")
@@ -264,6 +266,8 @@ class PRAfricaDustRouteMeteoNet(nn.Module):
         )
 
         self.pr_token = nn.Parameter(torch.randn(1, embed_dim) * 0.02)
+        if use_doy:
+            self.doy_proj = nn.Sequential(nn.Linear(2, embed_dim), nn.LayerNorm(embed_dim))
 
         self.pr_to_fused = CrossAttentionGate(
             embed_dim=embed_dim,
@@ -291,6 +295,7 @@ class PRAfricaDustRouteMeteoNet(nn.Module):
         station: str,                 # which station's head to use — never mix stations in one call
         aeronet_t=None,              # optional [B, aeronet_dim]
         return_attn=True,
+        doy=None,                    # [B, 2] (sin, cos) of the day of year; required if use_doy
     ):
         if station not in self.heads:
             raise ValueError(f"Unknown station {station!r}; known heads: {list(self.heads.keys())}")
@@ -307,6 +312,10 @@ class PRAfricaDustRouteMeteoNet(nn.Module):
 
         # Fuse dust source with route summaries
         S_all = torch.cat([z_dust_tok, S_route], dim=1)   # [B, 1 + C_r, D]
+        if self.use_doy:
+            if doy is None:
+                raise ValueError("use_doy=True but doy=None")
+            S_all = torch.cat([S_all, self.doy_proj(doy.to(S_all.dtype)).unsqueeze(1)], dim=1)   # [B, 2 + C_r, D]
 
         pr = self.pr_token.view(1, 1, -1).expand(B, 1, -1)
         z, attn_fusion = self.pr_to_fused(pr, S_all, need_weights=return_attn)
@@ -328,7 +337,7 @@ class PRAfricaDustRouteMeteoNet(nn.Module):
             meta = {
                 "route_channels": self.route_encoder.channel_names,
                 "meta_route": meta_route,
-                "fusion_token_names": ["dust_source"] + self.route_encoder.channel_names,
+                "fusion_token_names": ["dust_source"] + self.route_encoder.channel_names + (["doy"] if self.use_doy else []),
             }
             return y_hat, attn_route, attn_fusion, meta
 

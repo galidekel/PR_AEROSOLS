@@ -40,10 +40,10 @@ from pr_VIT_dustmeteo import PRAfricaDustRouteMeteoNet
 from train_main import (
     load_config, load_all_files, load_norm_stats,
     crop_area, build_route_dataset, build_dust_dataset,
-    load_station_targets, PRLazyDataset, make_split, apply_split_override, TargetTransform,
+    load_station_targets, PRLazyDataset, make_split, apply_split_override, TargetTransform, unpack_batch,
 )
 
-DEFAULT_SPECS = ["pv_700", "pv_900", "pv_850", "pv_*", "t_700", "t_850", "t_500", "z_500", "dust"]
+DEFAULT_SPECS = ["pv_700", "pv_900", "pv_850", "pv_*", "t_700", "t_850", "t_500", "z_500", "dust", "doy"]
 
 
 def log(msg):
@@ -111,12 +111,14 @@ def main():
     val_ds = Subset(full, val_idx)
     log(f"split: total={len(full)} train={n_train} val={n_val}  (n_folds={cfg.get('n_folds')} val_fold={cfg.get('val_fold')})")
 
+    USE_DOY = bool((ckpt.get("config") or {}).get("use_doy", cfg.get("use_doy", False)))
+    full.set_use_doy(USE_DOY)
     model = PRAfricaDustRouteMeteoNet(
         route_channel_names=route_channel_names, station_names=station_names,
         route_patch_size=tuple(cfg["route_patch_size"]), embed_dim=cfg["embed_dim"],
         num_heads_space=cfg["num_heads_space"], num_heads_fusion=cfg["num_heads_fusion"],
         dropout=cfg["dropout"], out_dim=cfg["out_dim"], T_in=cfg["t_in"],
-        H_route=route_da.shape[2], W_route=route_da.shape[3],
+        H_route=route_da.shape[2], W_route=route_da.shape[3], use_doy=USE_DOY,
     ).to(device)
     model.load_state_dict(ckpt["model_state"], strict=False)
     model.eval()
@@ -126,6 +128,11 @@ def main():
     for s in args.channels:
         if s == "dust":
             specs[s] = "dust"
+        elif s == "doy":
+            if USE_DOY:
+                specs[s] = "doy"
+            else:
+                log("skipping 'doy': the model has no day-of-year token")
         elif s.endswith("*"):
             idx = [i for i, n in enumerate(route_channel_names) if n.startswith(s[:-1])]
             if idx:
@@ -136,7 +143,7 @@ def main():
             specs[s] = [route_channel_names.index(s)]
         else:
             log(f"skipping {s!r}: not a route channel")
-    log(f"ablating: { {k: (v if v == 'dust' else len(v)) for k, v in specs.items()} }  (mode={args.mode})")
+    log(f"ablating: { {k: (v if isinstance(v, str) else len(v)) for k, v in specs.items()} }  (mode={args.mode})")
 
     rng = np.random.default_rng(args.seed)
     use_donor = args.mode in ("shuffle", "shuffle_season")
@@ -160,7 +167,7 @@ def main():
         perms = [rng.permutation(n_val) for _ in range(n_rep)]
 
     B = cfg["batch_size"]
-    y_all = np.array([full.samples[val_idx[i]][1] for i in range(n_val)])   # targets only; no data loading
+    y_all = np.array([np.atleast_1d(full.samples[val_idx[i]][1])[0] for i in range(n_val)])   # targets only; no data loading
     se_base = np.zeros(n_val)
     se_abl = {k: np.zeros((n_rep, n_val)) for k in specs}
 
@@ -169,36 +176,41 @@ def main():
     cur = {"ids": []}
 
     @torch.no_grad()
-    def predict(xd, xr):
-        p = model(xd, xr, station=inference_station, return_attn=False).squeeze(-1).cpu().numpy()
-        return p if tf.identity else tf.inverse([vdates[i] for i in cur["ids"]], p)   # always compare in AOD units
+    def predict(xd, xr, dy=None):
+        p = model(xd, xr, station=inference_station, return_attn=False, doy=dy).squeeze(-1).cpu().numpy()
+        p = p if tf.identity else tf.inverse([vdates[i] for i in cur["ids"]], p)   # always compare in AOD units
+        return p[:, 0] if p.ndim > 1 else p                                         # several outputs: the first one
 
     for start in range(0, n_val, B):
         ids = list(range(start, min(start + B, n_val)))
         cur["ids"] = ids
         xr = torch.stack([val_ds[i][0] for i in ids]).to(device)
         xd = torch.stack([val_ds[i][1] for i in ids]).to(device)
+        dy = torch.stack([val_ds[i][3] for i in ids]).to(device) if USE_DOY else None
         y = y_all[ids]
-        se_base[ids] = (predict(xd, xr) - y) ** 2
+        se_base[ids] = (predict(xd, xr, dy) - y) ** 2
 
         for r in range(n_rep):
             if use_donor:
                 donors = [int(perms[r][i]) for i in ids]
                 dr = torch.stack([val_ds[j][0] for j in donors]).to(device)
                 dd = torch.stack([val_ds[j][1] for j in donors]).to(device)
+                ddy = torch.stack([val_ds[j][3] for j in donors]).to(device) if USE_DOY else None
             for k, v in specs.items():
                 if v == "dust":
                     xd_m = dd if use_donor else torch.zeros_like(xd)
-                    pred = predict(xd_m, xr)
+                    pred = predict(xd_m, xr, dy)
+                elif v == "doy":                                  # ablate the season token only
+                    pred = predict(xd, xr, ddy if use_donor else torch.zeros_like(dy))
                 else:
                     xr_m = xr.clone()                           # [B, T_in, C_r, H, W]
                     xr_m[:, :, v] = dr[:, :, v] if use_donor else 0.0
-                    pred = predict(xd, xr_m)
+                    pred = predict(xd, xr_m, dy)
                 se_abl[k][r, ids] = (pred - y) ** 2
         log(f"batch {start // B + 1}/{int(np.ceil(n_val / B))}")
 
     # ── Statistics ──────────────────────────────────────────────────────────
-    train_mean = float(np.mean([full.samples[i][1] for i in train_idx]))
+    train_mean = float(np.mean([np.atleast_1d(full.samples[i][1])[0] for i in train_idx]))
     mse_clim = float(np.mean((y_all - train_mean) ** 2))
     mse_base = float(se_base.mean())
     log(f"val MSE intact={mse_base:.6f}   climatology (train-mean AOD)={mse_clim:.6f}   "

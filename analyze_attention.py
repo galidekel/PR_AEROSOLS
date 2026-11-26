@@ -36,7 +36,7 @@ from pr_VIT_dustmeteo import PRAfricaDustRouteMeteoNet
 from train_main import (
     load_config, load_all_files, load_norm_stats,
     crop_area, build_route_dataset, build_dust_dataset,
-    load_station_targets, PRLazyDataset, make_split, apply_split_override,
+    load_station_targets, PRLazyDataset, make_split, apply_split_override, TargetTransform, unpack_batch,
 )
 
 
@@ -56,6 +56,9 @@ def main():
                         help="Val samples with observed AOD >= this quantile form the HIGH-AOD group")
     parser.add_argument("--low_q",  type=float, default=0.50,
                         help="Val samples with observed AOD <= this quantile form the LOW-AOD group")
+    parser.add_argument("--infer_csv", default="infer.csv",
+                        help="Also write the predictions in the same format as infer.py (date, pred, target, cams_*; plus pred_/target_ "
+                             "columns when the model has several outputs). A bare name is created inside --out_dir; '' turns it off.")
     parser.add_argument("--n_folds",  type=int, default=None, help="Split: number of time blocks (default: split.json next to the checkpoint, else config)")
     parser.add_argument("--val_fold", type=int, default=None, help="Split: which block is the val set")
     args = parser.parse_args()
@@ -127,6 +130,8 @@ def main():
     log(f"split: total={len(full_dataset)}  train={len(train_idx)}  val={len(val_ds)}  "
         f"(n_folds={cfg.get('n_folds')} val_fold={cfg.get('val_fold')})")
 
+    USE_DOY = bool((ckpt.get("config") or {}).get("use_doy", cfg.get("use_doy", False)))
+    full_dataset.set_use_doy(USE_DOY)
     val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"], shuffle=False, num_workers=0)
 
     # ── Build model and load weights ───────────────────────────────────────
@@ -142,6 +147,7 @@ def main():
         T_in=cfg["t_in"],
         H_route=route_da.shape[2],
         W_route=route_da.shape[3],
+        use_doy=USE_DOY,
     ).to(device)
 
     missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
@@ -150,6 +156,7 @@ def main():
     if missing:
         log(f"missing keys (will use random init): {missing}")
     model.eval()
+    tf = TargetTransform.from_dict(ckpt.get("target_tf"))      # identity for runs trained without a target transform
     log("model loaded — starting attention extraction")
 
     # ── Collect dates for each val sample (mirrors infer.py) ──────────────
@@ -163,7 +170,7 @@ def main():
     # The all-sample average smears dust events together with clean days. Splitting by the
     # OBSERVED target lets us ask whether attention differs (e.g. follows a route) on high-AOD
     # days. Thresholds come from the val targets only, so no extra data loading.
-    val_targets = np.array([full_dataset.samples[val_idx[k]][1] for k in range(len(val_ds))])
+    val_targets = np.array([np.atleast_1d(full_dataset.samples[val_idx[k]][1])[0] for k in range(len(val_ds))])
     thr_hi = np.quantile(val_targets, args.high_q)
     thr_lo = np.quantile(val_targets, args.low_q)
     group = np.full(len(val_ds), -1, dtype=int)      # 1 = high AOD, 0 = low AOD, -1 = neither
@@ -175,6 +182,8 @@ def main():
 
     fusion_token_names = None
     fusion_rows = []          # one row per sample: date, pred, target, <token weights...>
+    infer_rows = []           # same samples in infer.py's CSV format (+ the CAMS dust input means)
+    extra_p, extra_t = [], []
 
     # Running sums for the Gate-1 (per-channel space-time) attention, so we
     # never hold [N, Tp, Hp, Wp] per channel in memory at once — only the
@@ -193,19 +202,31 @@ def main():
     limit = args.n_batches if args.n_batches > 0 else len(val_loader)
 
     with torch.no_grad():
-        for batch_idx, (x_route, x_dust, y) in enumerate(val_loader):
+        for batch_idx, batch in enumerate(val_loader):
             if batch_idx >= limit:
                 break
 
+            x_route, x_dust, y, doy, _ = unpack_batch(batch, USE_DOY)
             x_route = x_route.to(device)
             x_dust  = x_dust.to(device)
 
             y_hat, attn_route, attn_fusion, meta = model(
-                x_dust, x_route, station=inference_station, return_attn=True
+                x_dust, x_route, station=inference_station, return_attn=True,
+                doy=None if doy is None else doy.to(device)
             )
             preds = y_hat.squeeze(-1).cpu().numpy()
             tgts  = y.numpy()
             bs = len(preds)
+            _s0 = batch_idx * cfg["batch_size"]
+            if not tf.identity:                                  # report predictions in AOD units (targets are raw AOD)
+                preds = tf.inverse(val_dates[_s0 : _s0 + bs], preds)
+            if preds.ndim > 1:                                   # several outputs: the first one
+                extra_p.append(preds); extra_t.append(tgts)
+                preds, tgts = preds[:, 0], tgts[:, 0]
+            _cams = (x_dust.cpu() * dust_std + dust_mean).mean(dim=(1, 3, 4)).numpy()   # mean CAMS [total, dust] of the input
+            for _k in range(bs):
+                infer_rows.append({"date": val_dates[_s0 + _k].date(), "pred": float(preds[_k]), "target": float(tgts[_k]),
+                                   "cams_total_aod": float(_cams[_k, 0]), "cams_dust_aod": float(_cams[_k, 1])})
 
             if fusion_token_names is None:
                 fusion_token_names = meta["fusion_token_names"]
@@ -282,6 +303,19 @@ def main():
     np.savez(npz_path, **save_dict)
     log(f"saved {npz_path}  ({len(route_channel_names)} channels, averaged over {n_seen} samples; "
         f"high-AOD n={n_hi_seen}, low-AOD n={n_lo_seen})")
+
+    if args.infer_csv:
+        icsv = Path(args.infer_csv) if Path(args.infer_csv).is_absolute() or Path(args.infer_csv).parent != Path(".") else out_dir / args.infer_csv
+        idf = pd.DataFrame(infer_rows)
+        if extra_p:
+            EP, ET = np.concatenate(extra_p), np.concatenate(extra_t)
+            names = cfg["stations"][0].get("target_cols") or [f"out{k}" for k in range(EP.shape[1])]
+            for k, nm in enumerate(names):
+                idf[f"pred_{nm}"], idf[f"target_{nm}"] = EP[:len(idf), k], ET[:len(idf), k]
+        idf.to_csv(icsv, index=False)
+        mse = float(np.mean((idf.pred - idf.target) ** 2))
+        log(f"saved {icsv}  ({len(idf)} rows)   MSE={mse:.4f}  R²={1 - mse / (float(np.var(idf.target)) + 1e-9):.4f}   "
+            f"(same format as infer.py, so infer.py is no longer needed for this checkpoint)")
 
     log("done")
 
